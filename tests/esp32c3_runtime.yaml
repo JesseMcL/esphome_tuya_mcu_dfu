@@ -1,0 +1,41 @@
+# Compile-only check (CI): runtime fetch on a real ESP32-C3 target.
+esphome:
+  name: tuya-mcu-dfu-esp32c3
+
+esp32:
+  variant: esp32c3
+  framework:
+    type: esp-idf
+
+external_components:
+  - source:
+      type: local
+      path: ../components
+    components: [tuya_mcu_dfu]
+
+logger:
+  baud_rate: 0
+
+wifi:
+  ssid: test
+  password: test-password
+
+http_request:
+
+uart:
+  id: mcu_uart
+  tx_pin: GPIO21
+  rx_pin: GPIO20
+  baud_rate: 9600
+
+tuya:
+  id: mcu
+  uart_id: mcu_uart
+
+update:
+  - platform: tuya_mcu_dfu
+    name: MCU firmware
+    uart_id: mcu_uart
+    fetch: runtime
+    source: https://example.com/mcu/manifest.json
+    max_size: 131072

@@ -1,0 +1,11 @@
+# Runtime fetch of a manifest whose MD5 doesn't match the image: the download
+# must be rejected and nothing sent to the MCU.
+packages:
+  base: !include host_runtime.yaml
+
+substitutions:
+  name: tuya-mcu-dfu-test-bad-md5
+
+update:
+  - id: !extend mcu_firmware
+    source: http://127.0.0.1:8765/bad/manifest.json

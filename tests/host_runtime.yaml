@@ -1,0 +1,16 @@
+# As host.yaml, but the manifest and image are fetched by the device at
+# runtime with http_request (run.sh serves build/ on 127.0.0.1:8765).
+packages:
+  base: !include host.yaml
+
+substitutions:
+  name: tuya-mcu-dfu-test-runtime
+
+http_request:
+  timeout: 5s
+
+update:
+  - id: !extend mcu_firmware
+    fetch: runtime
+    source: http://127.0.0.1:8765/manifest.json
+    required: !remove

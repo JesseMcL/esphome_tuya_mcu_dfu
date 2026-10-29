@@ -1,0 +1,11 @@
+# As host.yaml, but without a version datapoint: the update is verified by
+# tuya: initialising again after the MCU restarts.
+packages:
+  base: !include host.yaml
+
+substitutions:
+  name: tuya-mcu-dfu-test-nodp
+
+update:
+  - id: !extend mcu_firmware
+    version_datapoint: !remove

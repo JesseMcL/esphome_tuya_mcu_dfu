@@ -21,7 +21,23 @@ jobs:
           python-version: "3.12"
       - name: Install
         run: |
-          sudo apt-get update && sudo apt-get install -y socat
+          sudo apt-get update && sudo apt-get install -y socat libssl-dev
           pip install --upgrade ${{ matrix.esphome }}
       - name: Update to a fake MCU over a pty
         run: bash tests/run.sh
+
+  compile-esp32c3:
+    runs-on: ubuntu-latest
+    name: compile ESP32-C3 (fetch runtime)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-esp32c3-${{ hashFiles('tests/esp32c3_runtime.yaml') }}
+      - run: pip install --upgrade esphome
+      - name: Compile
+        run: esphome compile tests/esp32c3_runtime.yaml

@@ -1,5 +1,5 @@
 # Host test (run.sh): ESPHome on the `host` platform, UART on a pty to
-# fake_mcu.py. Installs the bundled firmware 3 s after boot.
+# fake_mcu.py. Checks for and installs the bundled firmware 3 s after boot.
 substitutions:
   name: tuya-mcu-dfu-test
 
@@ -9,8 +9,15 @@ esphome:
     priority: -100
     then:
       - delay: 3s
-      - logger.log: "TEST: starting update"
-      - update.perform: mcu_firmware
+      - update.check: mcu_firmware
+      - if:
+          condition:
+            update.is_available: mcu_firmware
+          then:
+            - logger.log: "TEST: update available, starting"
+            - update.perform: mcu_firmware
+          else:
+            - logger.log: "TEST: no update available"
 
 external_components:
   - source:

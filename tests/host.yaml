@@ -1,0 +1,42 @@
+# Host test (run.sh): ESPHome on the `host` platform, UART on a pty to
+# fake_mcu.py. Installs the bundled firmware 3 s after boot.
+substitutions:
+  name: tuya-mcu-dfu-test
+
+esphome:
+  name: ${name}
+  on_boot:
+    priority: -100
+    then:
+      - delay: 3s
+      - logger.log: "TEST: starting update"
+      - update.perform: mcu_firmware
+
+external_components:
+  - source:
+      type: local
+      path: ../components
+    components: [tuya_mcu_dfu]
+
+host:
+
+logger:
+  level: DEBUG
+
+uart:
+  id: mcu_uart
+  port: /tmp/tuya-mcu-dfu-esp
+  baud_rate: 115200
+
+tuya:
+  id: mcu
+  uart_id: mcu_uart
+
+update:
+  - platform: tuya_mcu_dfu
+    id: mcu_firmware
+    name: MCU firmware
+    uart_id: mcu_uart
+    source: build/manifest.json
+    required: true
+    version_datapoint: 120

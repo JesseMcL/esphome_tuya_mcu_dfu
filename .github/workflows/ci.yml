@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 4 * * 1"     # weekly, catches ESPHome API changes
+
+jobs:
+  host-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        esphome: ["esphome", "esphome --pre"]
+    name: host test (${{ matrix.esphome }})
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          sudo apt-get update && sudo apt-get install -y socat
+          pip install --upgrade ${{ matrix.esphome }}
+      - name: Update to a fake MCU over a pty
+        run: tests/run.sh

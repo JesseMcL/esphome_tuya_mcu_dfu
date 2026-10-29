@@ -27,6 +27,23 @@ The image is sent with the standard [Tuya MCU upgrade protocol](https://develope
 >
 > Use this with MCU firmware you control, or after you have a tested way to recover the MCU. You are responsible for what you send to it.
 
+### Intended use
+
+In theory this component could replace a device's **stock** Tuya MCU firmware, since it speaks the same protocol a Tuya module uses. It is **designed for MCUs where you already control the code**: you wrote or built the firmware running on the MCU, and you know how it handles the upgrade command (typically your own bootloader). That is the setup it has been tested in.
+
+Replacing stock firmware is a different problem, and a device-specific one:
+
+- **The stock updater decides what it accepts.** Its expected image format, target address and checks are unknown.
+- **An update over this protocol is usually limited to what that updater writes**, typically the application area. Whether the rest of the chip can change depends on the MCU and on code you get to run on it:
+  - the bootloader region;
+  - the size of the boot/application partitions;
+  - configuration and option bytes (boot source, reset pin, read protection, watchdog).
+
+  Some MCUs let running code reprogram all of that. For example, the Nuvoton MS51 can rewrite its LDROM and CONFIG bytes, including the LDROM size, by IAP from the application. Others can only be changed with a programmer.
+- **Partition changes are risky without a recovery path.** A first image that changes the partitioning, the bootloader or option bytes from inside the MCU has to survive power loss at every step. Without a programmer as a fallback, a mistake there is usually permanent.
+
+If you plan to try it, start with a device you can recover by ICP, SWD or similar.
+
 ## Usage
 
 ```yaml
@@ -169,7 +186,7 @@ As of late 2026, I found **no public report of a *stock* Tuya MCU firmware being
 
 | Project | MCU | Status |
 |---|---|---|
-| [GL-C-301W_ESPHome](https://github.com/JesseMcL/GL-C-301W_ESPHome) (this component's origin) | Nuvoton MS51FC0AE in a Gledopto GL-C-301W | Replacement MCU firmware with its own LDROM bootloader that implements this protocol. The first install is by ICP. The ESPHome-to-bootloader path is verified against a simulator running the real bootloader code, but not yet on hardware. An update to the **stock** MCU firmware through its own updater is an open experiment. |
+| [GL-C-301W_ESPHome](https://github.com/JesseMcL/GL-C-301W_ESPHome) (this component's origin) | Nuvoton MS51FC0AE in a Gledopto GL-C-301W | Replacement MCU firmware with its own LDROM bootloader that implements this protocol. The first install is by ICP. Updates from ESPHome through that bootloader are **confirmed on hardware**. Replacing the **stock** MCU firmware through its own updater is untested. |
 | [OpenSSS10](https://github.com/lwalkera/OpenSSS10) | FT32F030C8AT7 in a Tuya Wi-Fi smart switch | Replacement MCU firmware that runs behind the stock bootloader. `make ota` sends it through OpenBeken with `0x0A`/`0x0B`, which needs OpenBeken MCU-update support that was still a proposed pull request. The README recommends a first flash by SWD and calls the stock OTA path untested. |
 | [Open-TuyaMCU for Nuvoton](https://www.elektroda.com/rtvforum/topic3963639.html) (elektroda, 2023) | Nuvoton in a Treatlife DS02S | Replacement MCU firmware flashed by SWD. The author notes the Tuya update protocol is documented but not implemented. |
 | [Tuya Module Debugging Assistant](https://www.elektroda.com/rtvforum/topic4085796.html) (elektroda, 2024) | Simulated | The reverse direction: Tuya's PC tool impersonates an MCU, so the cloud pushes the vendor's MCU image to it and it saves the file. Useful for obtaining an official image, but nothing was flashed. |

@@ -1,0 +1,15 @@
+# Inline firmware whose SHA-256 doesn't match: the build must fail.
+packages:
+  base: !include host.yaml
+
+substitutions:
+  name: tuya-mcu-dfu-test-inline-bad
+
+update:
+  - id: !extend mcu_firmware
+    source: !remove
+    required: !remove
+    firmware:
+      url: http://127.0.0.1:8765/firmware.bin
+      version: 1.1.0
+      sha256: "0000000000000000000000000000000000000000000000000000000000000000"

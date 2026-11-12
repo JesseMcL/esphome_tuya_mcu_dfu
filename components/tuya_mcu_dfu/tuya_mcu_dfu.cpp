@@ -4,11 +4,11 @@
 
 #include "esphome/core/hal.h"
 #include "esphome/core/log.h"
+#include "esphome/components/md5/md5.h"
 
 #ifdef USE_TUYA_MCU_DFU_RUNTIME
 #include "esphome/core/application.h"
 #include "esphome/components/json/json_util.h"
-#include "esphome/components/md5/md5.h"
 #include "esphome/components/network/util.h"
 #endif
 
@@ -21,6 +21,8 @@ static constexpr uint8_t CMD_PRODUCT = 0x01;
 static constexpr uint8_t CMD_OTA_START = 0x0A;
 static constexpr uint8_t CMD_OTA_DATA = 0x0B;
 static constexpr size_t MAX_RX = 512;                 // product info JSON can be a few hundred bytes
+// 0x0A reply: packet size code -> bytes (as TuyaOS; unknown codes = 256)
+static constexpr uint16_t PACKET_SIZES[] = {256, 512, 1024, 2048, 3072, 4096};
 static constexpr uint32_t END_ACK_TIMEOUT = 1500;     // the end frame needn't be acknowledged
 static constexpr uint32_t PRODUCT_QUERY_INTERVAL = 1000;
 static constexpr uint32_t PRODUCT_WINDOW = 10000;     // then fall back to the version DP
@@ -85,6 +87,10 @@ void TuyaMcuDfu::dump_config() {
     ESP_LOGCONFIG(TAG, "  Bundled firmware: none");
   }
 #endif
+  if (this->channel_ > 9)
+    ESP_LOGCONFIG(TAG, "  Firmware channel: %u (8-byte start frame)", this->channel_);
+  ESP_LOGCONFIG(TAG, "  Timeouts: start %" PRIu32 " ms, packet %" PRIu32 " ms, %u retries", this->start_timeout_,
+                this->packet_timeout_, this->retries_);
   ESP_LOGCONFIG(TAG, "  MCU version: %s",
                 this->update_info_.current_version.empty() ? "unknown" : this->update_info_.current_version.c_str());
 }
@@ -145,7 +151,38 @@ void TuyaMcuDfu::perform(bool force) {
     ESP_LOGW(TAG, "No MCU firmware image available");
     return;
   }
+  // Nothing goes to the MCU unless the image is exactly the release's
+  if (!this->check_image_()) {
+#ifdef USE_TUYA_MCU_DFU_RUNTIME
+    this->free_image_();
+#endif
+    this->status_set_error(LOG_STR("MCU firmware image corrupt"));
+    this->publish_state();
+    return;
+  }
   this->begin_transfer_();
+}
+
+bool TuyaMcuDfu::check_image_() {
+  md5::MD5Digest md5;
+  md5.init();
+  uint8_t buf[64];
+  for (size_t i = 0; i < this->fw_len_;) {
+    size_t n = std::min(sizeof(buf), this->fw_len_ - i);
+    for (size_t j = 0; j < n; j++)
+      buf[j] = this->fw_byte_(i + j);
+    md5.add(buf, n);
+    i += n;
+  }
+  md5.calculate();
+  if (!md5.equals_hex(this->update_info_.md5.c_str())) {
+    char got[33];
+    md5.get_hex(got);
+    ESP_LOGE(TAG, "MD5 mismatch, image rejected (expected %s, got %s)", this->update_info_.md5.c_str(), got);
+    return false;
+  }
+  ESP_LOGD(TAG, "Image MD5 ok (%s)", this->update_info_.md5.c_str());
+  return true;
 }
 
 void TuyaMcuDfu::begin_transfer_() {
@@ -161,6 +198,8 @@ void TuyaMcuDfu::begin_transfer_() {
   this->rx_.clear();
   this->offset_ = 0;
   this->tries_ = 0;
+  this->packet_size_ = 256;
+  this->offset_width_ = 4;
   this->phase_ = Phase::START;
   this->high_freq_.start();
   this->enable_loop();
@@ -195,10 +234,24 @@ void TuyaMcuDfu::send_frame_(uint8_t cmd, const uint8_t *payload, size_t len) {
 }
 
 void TuyaMcuDfu::send_start_() {
-  uint8_t p[4] = {(uint8_t) (this->fw_len_ >> 24), (uint8_t) (this->fw_len_ >> 16), (uint8_t) (this->fw_len_ >> 8),
-                  (uint8_t) this->fw_len_};
-  ESP_LOGD(TAG, "-> start (%u bytes), try %u", (unsigned) this->fw_len_, this->tries_ + 1);
-  this->send_frame_(CMD_OTA_START, p, sizeof(p));
+  // TuyaOS adds the firmware channel only for channels above 9
+  uint8_t p[8] = {(uint8_t) (this->fw_len_ >> 24), (uint8_t) (this->fw_len_ >> 16), (uint8_t) (this->fw_len_ >> 8),
+                  (uint8_t) this->fw_len_, this->channel_, 0, 0, 0};
+  size_t len = this->channel_ > 9 ? 8 : 4;
+  ESP_LOGD(TAG, "-> start (%u bytes%s), try %u", (unsigned) this->fw_len_, len == 8 ? ", with channel" : "",
+           this->tries_ + 1);
+  this->send_frame_(CMD_OTA_START, p, len);
+}
+
+// 0x0B: offset (u32 or u16 BE) followed by n image bytes from that offset
+void TuyaMcuDfu::send_offset_frame_(uint32_t offset, size_t n) {
+  const size_t w = this->offset_width_;
+  std::vector<uint8_t> p(w + n);
+  for (size_t i = 0; i < w; i++)
+    p[i] = offset >> (8 * (w - 1 - i));
+  for (size_t i = 0; i < n; i++)
+    p[w + i] = this->fw_byte_(offset + i);
+  this->send_frame_(CMD_OTA_DATA, p.data(), p.size());
 }
 
 void TuyaMcuDfu::send_packet_() {
@@ -206,21 +259,12 @@ void TuyaMcuDfu::send_packet_() {
   if (n > this->packet_size_)
     n = this->packet_size_;
   this->last_len_ = n;
-  std::vector<uint8_t> p(4 + n);
-  p[0] = this->offset_ >> 24;
-  p[1] = this->offset_ >> 16;
-  p[2] = this->offset_ >> 8;
-  p[3] = this->offset_;
-  for (size_t i = 0; i < n; i++)
-    p[4 + i] = this->fw_byte_(this->offset_ + i);
-  this->send_frame_(CMD_OTA_DATA, p.data(), p.size());
+  this->send_offset_frame_(this->offset_, n);
 }
 
 void TuyaMcuDfu::send_end_() {
-  uint8_t p[4] = {(uint8_t) (this->fw_len_ >> 24), (uint8_t) (this->fw_len_ >> 16), (uint8_t) (this->fw_len_ >> 8),
-                  (uint8_t) this->fw_len_};
   ESP_LOGD(TAG, "-> end");
-  this->send_frame_(CMD_OTA_DATA, p, sizeof(p));
+  this->send_offset_frame_(this->fw_len_, 0);
 }
 
 void TuyaMcuDfu::send_product_query_() {
@@ -311,16 +355,27 @@ void TuyaMcuDfu::on_product_(const uint8_t *data, size_t len) {
   // else e.g. a bootloader answering with its own version: keep asking
 }
 
-void TuyaMcuDfu::on_frame_(uint8_t cmd, const uint8_t *data, size_t len) {
+void TuyaMcuDfu::on_frame_(uint8_t ver, uint8_t cmd, const uint8_t *data, size_t len) {
 #if ESPHOME_LOG_LEVEL >= ESPHOME_LOG_LEVEL_VERBOSE
   char hex[format_hex_pretty_size(16)];
-  ESP_LOGV(TAG, "<- cmd 0x%02X len %u [%s]", cmd, (unsigned) len,
+  ESP_LOGV(TAG, "<- ver %u cmd 0x%02X len %u [%s]", ver, cmd, (unsigned) len,
            format_hex_pretty_to(hex, data, len > 16 ? 16 : len));
 #endif
   if (this->phase_ == Phase::START && cmd == CMD_OTA_START) {
-    uint8_t sel = len >= 1 ? data[0] : 0;
-    this->packet_size_ = sel == 1 ? 512 : sel == 2 ? 1024 : 256;
-    ESP_LOGI(TAG, "MCU accepted update, %u-byte packets", this->packet_size_);
+    uint8_t code = len >= 1 ? data[0] : 0;
+    if (code >= sizeof(PACKET_SIZES) / sizeof(PACKET_SIZES[0])) {
+      ESP_LOGW(TAG, "Unknown packet size code %u, using 256 bytes", code);
+      code = 0;
+    }
+    this->packet_size_ = PACKET_SIZES[code];
+    // As TuyaOS: a reply frame with protocol version 0 means 16-bit offsets
+    this->offset_width_ = ver == 0 ? 2 : 4;
+    ESP_LOGI(TAG, "MCU accepted update (code %u, frame version %u): %u-byte packets, %u-byte offsets", code, ver,
+             this->packet_size_, this->offset_width_);
+    if (this->offset_width_ == 2 && this->fw_len_ > 0xFFFF) {
+      this->fail_("image too large for the MCU's 16-bit offsets");
+      return;
+    }
     this->phase_ = Phase::DATA;
     this->tries_ = 0;
     this->send_packet_();
@@ -370,7 +425,7 @@ void TuyaMcuDfu::poll_uart_() {
     for (size_t i = 0; i < 6 + len; i++)
       sum += this->rx_[i];
     if (sum == this->rx_[6 + len])
-      this->on_frame_(this->rx_[3], this->rx_.data() + 6, len);
+      this->on_frame_(this->rx_[2], this->rx_[3], this->rx_.data() + 6, len);
     this->rx_.clear();
     if (this->phase_ == Phase::IDLE || !this->parent_->is_idle())
       return;  // finished: the rest belongs to tuya:
@@ -595,16 +650,7 @@ bool TuyaMcuDfu::download_image_() {
     allocator.deallocate(buf, cap);
     return false;
   }
-  md5::MD5Digest md5;
-  md5.init();
-  md5.add(buf, n);
-  md5.calculate();
-  if (!md5.equals_hex(this->update_info_.md5.c_str())) {
-    ESP_LOGE(TAG, "MD5 mismatch, image rejected");
-    allocator.deallocate(buf, cap);
-    return false;
-  }
-  ESP_LOGI(TAG, "Downloaded %d bytes, MD5 ok", n);
+  ESP_LOGI(TAG, "Downloaded %d bytes", n);  // MD5 is checked in perform()
   this->ram_ = buf;
   this->ram_size_ = cap;
   this->fw_ = buf;

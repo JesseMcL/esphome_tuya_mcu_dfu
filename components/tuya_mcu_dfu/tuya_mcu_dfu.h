@@ -17,11 +17,14 @@
 namespace esphome::tuya_mcu_dfu {
 
 /// Updates the MCU behind a `tuya:` component with the standard Tuya MCU
-/// upgrade protocol:
-///   module -> MCU  0x0A [size u32 BE]              MCU -> 0x0A [pkt size sel]
-///   module -> MCU  0x0B [offset u32 BE][data]      MCU -> 0x0B []
-///   module -> MCU  0x0B [size u32 BE]              (end, ack optional)
+/// upgrade protocol, as a Tuya module (TuyaOS) sends it:
+///   module -> MCU  0x0A [size u32 BE]              MCU -> 0x0A [pkt size code]
+///                  (channel > 9: [size u32 BE][channel][0 0 0])
+///   module -> MCU  0x0B [offset][data]             MCU -> 0x0B []
+///   module -> MCU  0x0B [offset = size]            (end, ack optional)
 ///   module -> MCU  0x01                            MCU -> 0x01 {"v":"<new>",..}
+/// Packet size code 0..5 = 256, 512, 1024, 2048, 3072, 4096 bytes. The offset
+/// is u32 BE, or u16 BE if the MCU's 0x0A reply frame has version byte 0.
 /// While transferring and verifying, the `tuya:` component's loop is suspended
 /// so this component sees the MCU's replies (`tuya:` then reports is_idle();
 /// code that writes datapoints should hold off meanwhile). Afterwards `tuya:`
@@ -36,6 +39,7 @@ class TuyaMcuDfu : public update::UpdateEntity, public Component, public uart::U
     this->version_dp_ = dp;
     this->has_version_dp_ = true;
   }
+  void set_channel(uint8_t channel) { this->channel_ = channel; }
   void set_timeouts(uint32_t start_ms, uint32_t packet_ms, uint32_t verify_ms, uint8_t retries) {
     this->start_timeout_ = start_ms;
     this->packet_timeout_ = packet_ms;
@@ -75,7 +79,9 @@ class TuyaMcuDfu : public update::UpdateEntity, public Component, public uart::U
   void send_packet_();
   void send_end_();
   void send_product_query_();
-  void on_frame_(uint8_t cmd, const uint8_t *data, size_t len);
+  void on_frame_(uint8_t ver, uint8_t cmd, const uint8_t *data, size_t len);
+  void send_offset_frame_(uint32_t offset, size_t n);
+  bool check_image_();
   void on_product_(const uint8_t *data, size_t len);
   void poll_uart_();
   void fail_(const char *why);
@@ -91,7 +97,9 @@ class TuyaMcuDfu : public update::UpdateEntity, public Component, public uart::U
   bool fw_in_ram_{false};
   std::string fw_version_;  ///< version of the available release, "" = none known
 
-  uint32_t start_timeout_{8000};
+  uint8_t channel_{0};
+
+  uint32_t start_timeout_{5000};
   uint32_t packet_timeout_{5000};
   uint32_t verify_timeout_{60000};
   uint8_t retries_{3};
@@ -99,6 +107,7 @@ class TuyaMcuDfu : public update::UpdateEntity, public Component, public uart::U
   Phase phase_{Phase::IDLE};
   uint32_t offset_{0};
   uint16_t packet_size_{256};
+  uint8_t offset_width_{4};  ///< 4, or 2 if the MCU's 0x0A reply has frame version 0
   uint16_t last_len_{0};
   uint8_t tries_{0};
   uint32_t sent_at_{0};

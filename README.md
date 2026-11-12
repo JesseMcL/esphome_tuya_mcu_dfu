@@ -2,7 +2,7 @@
 
 An ESPHome external component that updates the firmware of the **MCU behind a Tuya Wi-Fi module**: the microcontroller ESPHome talks to with the [`tuya:`](https://esphome.io/components/tuya.html) component. It appears in Home Assistant as a normal **update** entity, with an installed version, a latest version, progress and an Install button.
 
-The image is sent with the standard [Tuya MCU upgrade protocol](https://developer.tuya.com/en/docs/mcu-standard-protocol/MCUSDK-wifi-mcuota?id=Kd2fv0vlx6wp4) (`0x0A` / `0x0B`). It comes from a release manifest, which is fetched in one of two ways:
+The image is sent with the standard [Tuya MCU upgrade protocol](https://developer.tuya.com/en/docs/mcu-standard-protocol/MCUSDK-wifi-mcuota?id=Kd2fv0vlx6wp4) (`0x0A` / `0x0B`), the way a Tuya module (TuyaOS) sends it: all six packet sizes, 16- or 32-bit offsets and the firmware channel. Its MD5 is checked on the device before anything is sent. The image comes from a release manifest, or from a URL or file pinned by its hash, fetched in one of two ways:
 
 - **When ESPHome compiles** (`fetch: build`, the default). The image is bundled into the ESPHome binary. This works on every platform, including BK72xx/LibreTiny, which has no `http_request`.
 - **By the device itself** (`fetch: runtime`), using [`http_request`](https://esphome.io/components/http_request/) (ESP32, ESP8266, RP2040, host). New MCU releases show up without rebuilding ESPHome.
@@ -69,6 +69,20 @@ update:
     version_datapoint: 120            # optional, see below
 ```
 
+A single image pinned by its hash, without a manifest (`fetch: build` only):
+
+```yaml
+update:
+  - platform: tuya_mcu_dfu
+    name: MCU firmware
+    uart_id: mcu_uart
+    firmware:
+      url: https://example.com/mcu-1.0.5.bin   # or path: relative to the YAML
+      version: 1.0.5                           # what the MCU reports afterwards
+      sha256: b22da684…                        # or md5; required for url
+      size: 20480                              # optional
+```
+
 Runtime fetch on targets with `http_request`:
 
 ```yaml
@@ -86,18 +100,20 @@ update:
 
 | Option | Default | |
 |---|---|---|
-| `source` | required | Release manifest: an `http(s)://` URL, or, with `fetch: build` only, a path relative to the YAML. |
+| `source` | | Release manifest: an `http(s)://` URL, or, with `fetch: build` only, a path relative to the YAML. Give `source` or `firmware`. |
+| `firmware` | | `fetch: build` only, instead of `source`: one image. `url` or `path` (relative to the YAML); `version` (required); `sha256` and/or `md5` (required with `url`, optional with `path`); optional `size`, `title`, `summary`, `release_url`. Any fetch failure or mismatch fails the build. |
 | `fetch` | `build` | `build`: fetched when ESPHome compiles and bundled. `runtime`: fetched by the device with `http_request`. |
 | `uart_id` | | The UART used by `tuya:`. |
 | `tuya_id` | the only `tuya:` | |
 | `version_datapoint` | none | String datapoint in which the MCU reports its firmware version (see below). |
 | `chip_family` | the only build | Selects `builds[].chipFamily` in the manifest. Required if it has several builds. |
-| `start_timeout` | `8s` | Wait for the MCU's reply to `0x0A`. |
+| `channel` | none | Firmware channel (type). Above 9, the `0x0A` start frame carries it (8-byte form), as a Tuya module does; 0–9 send the size alone. |
+| `start_timeout` | `5s` | Wait for the MCU's reply to `0x0A`. |
 | `packet_timeout` | `5s` | Wait for each `0x0B` acknowledgement. |
 | `verify_timeout` | `60s` | Wait for the MCU to come back with the new version. |
 | `retries` | `3` | Retries per frame before giving up. |
 | **`fetch: build` only** | | |
-| `required` | `false` | Fail the build if the manifest or image can't be fetched. If `false`, the build continues without firmware: a warning is logged and the entity has no state. |
+| `required` | `false` | Fail the build if the manifest or image can't be fetched. If `false`, the build continues without firmware: a warning is logged and the entity has no state. A wrong MD5 or `size` in the manifest always fails. `firmware:` is always required. |
 | **`fetch: runtime` only** | | |
 | `http_request_id` | the only `http_request:` | |
 | `update_interval` | `6h` | How often to check the manifest. The first check is 15 s after boot. `update.check` triggers one manually. |
@@ -113,8 +129,12 @@ All the usual [update entity](https://esphome.io/components/update/) options, tr
 ### Runtime fetch: things to know
 
 - **Downloading blocks the main loop**, like ESPHome's own `http_request` OTA on most platforms. The manifest is usually under 1 KB. A 64 KB image over Wi-Fi typically takes a second or two.
-- **The download happens when you press Install**, not at check time, so the RAM is only used during an update. The MD5 is checked before anything is sent to the MCU. A mismatch, a short download or an oversized image aborts the update, and the MCU is not touched.
+- **The download happens when you press Install**, not at check time, so the RAM is only used during an update. A short download or an oversized image aborts the update, and the MCU is not touched.
 - **HTTPS** follows `http_request`'s settings: the certificate bundle on ESP32, or `verify_ssl: false`. GitHub `…/releases/latest/download/…` redirects; `http_request` follows them by default.
+
+### Image check before sending
+
+Before the `0x0A` start frame, `perform()` checks the image's MD5 against the release's, for bundled and downloaded images alike. A mismatch (a bad download, or a corrupted bundled copy) logs `MD5 mismatch, image rejected`, sets an error and sends nothing. Bundled images are also checked when ESPHome compiles: against the manifest's `md5` (and `size`), or the `firmware:` hash.
 
 ### Version and verification
 
@@ -162,19 +182,23 @@ python tools/make_manifest.py mcu-1.2.0.bin --version 1.2.0 --chip-family MS51FC
   --name "My MCU firmware" -o manifest.json
 ```
 
-Upload both files as GitHub release assets, and `…/releases/latest/download/manifest.json` always points to the newest release. With `fetch: build`, downloads are cached by MD5 in `.esphome/tuya_mcu_dfu/`.
+Upload both files as GitHub release assets, and `…/releases/latest/download/manifest.json` always points to the newest release. With `fetch: build`, downloads are cached by their hash in `.esphome/tuya_mcu_dfu/`.
 
 ## Protocol
 
+As sent by TuyaOS 3.x (reverse engineered from a BK7231N module's firmware; see [Known uses](#known-uses-outside-an-official-tuya-module)):
+
 | Direction | Frame | |
 |---|---|---|
-| module → MCU | `0x0A` size (u32 BE) | start |
-| MCU → module | `0x0A` packet size: `0` = 256, `1` = 512, `2` = 1024 bytes | accepted |
-| module → MCU | `0x0B` offset (u32 BE) + data | one packet |
+| module → MCU | `0x0A` size (u32 BE); with `channel` > 9: size, channel, 3 zero bytes | start |
+| MCU → module | `0x0A` packet size code: `0` (or empty) = 256, `1` = 512, `2` = 1024, `3` = 2048, `4` = 3072, `5` = 4096 bytes | accepted. Frame version byte `0` = 16-bit offsets from here on, otherwise 32-bit |
+| module → MCU | `0x0B` offset (u32 or u16 BE) + data | one packet |
 | MCU → module | `0x0B` (empty) | acknowledged; next packet |
-| module → MCU | `0x0B` size (u32 BE), no data | end. An acknowledgement is optional |
+| module → MCU | `0x0B` offset = size, no data | end. An acknowledgement is optional |
 | module → MCU | `0x01` | product information request |
 | MCU → module | `0x01` `{"p":…,"v":"<version>",…}` | must carry the new version within a minute (Tuya spec) |
+
+Nothing else is added: no image header, no checksum besides each frame's byte sum. A module tries each frame 3 times with a 5 s timeout, the defaults here too.
 
 While transferring and verifying, the component suspends `tuya:`'s loop so it can read the MCU's replies itself. Code that writes datapoints should hold off until the update finishes; `tuya:` reports `is_idle()` during that time. Afterwards `tuya:` resumes and gets a heartbeat straight away. An MCU that restarted answers that heartbeat with `0x00`, which makes `tuya:` initialise again.
 
@@ -187,6 +211,7 @@ As of late 2026, I found **no public report of a *stock* Tuya MCU firmware being
 | Project | MCU | Status |
 |---|---|---|
 | [GL-C-301W_ESPHome](https://github.com/JesseMcL/GL-C-301W_ESPHome) (this component's origin) | Nuvoton MS51FC0AE in a Gledopto GL-C-301W | Replacement MCU firmware with its own LDROM bootloader that implements this protocol. The first install is by ICP. Updates from ESPHome through that bootloader are **confirmed on hardware**. Replacing the **stock** MCU firmware through its own updater is untested. |
+| Tuya PS10 presence sensor (board NAS-PS10W6) | FMD FT61E0A5 (PIC16F1-like), stock bootloader | Work in progress, **not yet tested on hardware**. The official 1.0.5 MCU image is a raw application linked above a resident bootloader, with no header or checksum. The app's `0x0A` handler doesn't reply: it marks the app invalid in data EEPROM and resets, and the bootloader answers the **retried** `0x0A` and takes the `0x0B` packets. The stock module (TuyaOS 3.11) protocol details above come from this device. A host test simulates the ignored first `0x0A`. |
 | [OpenSSS10](https://github.com/lwalkera/OpenSSS10) | FT32F030C8AT7 in a Tuya Wi-Fi smart switch | Replacement MCU firmware that runs behind the stock bootloader. `make ota` sends it through OpenBeken with `0x0A`/`0x0B`, which needs OpenBeken MCU-update support that was still a proposed pull request. The README recommends a first flash by SWD and calls the stock OTA path untested. |
 | [Open-TuyaMCU for Nuvoton](https://www.elektroda.com/rtvforum/topic3963639.html) (elektroda, 2023) | Nuvoton in a Treatlife DS02S | Replacement MCU firmware flashed by SWD. The author notes the Tuya update protocol is documented but not implemented. |
 | [Tuya Module Debugging Assistant](https://www.elektroda.com/rtvforum/topic4085796.html) (elektroda, 2024) | Simulated | The reverse direction: Tuya's PC tool impersonates an MCU, so the cloud pushes the vendor's MCU image to it and it saves the file. Useful for obtaining an official image, but nothing was flashed. |
@@ -199,10 +224,16 @@ Successful updates (or failures) with this component are welcome as issues, with
 
 | Config | Checks |
 |---|---|
-| `host.yaml` | Bundled image, version DP. |
-| `host_no_version_dp.yaml` | Bundled image, verified through product information only. |
+| `host.yaml` | Bundled image from a manifest, version DP. Repeated against every packet size code (0–5), 16-bit offsets (reply frame version 0), and an MCU that ignores the first `0x0A`. |
+| `host_no_version_dp.yaml` | Verified through product information only. |
+| `host_channel.yaml` | `channel: 10`: the 8-byte start frame. |
+| `host_inline_url.yaml` | `firmware:` from a URL, pinned by SHA-256 and size. |
+| `host_inline_path.yaml` | `firmware:` from a local file, no hash. |
+| `host_inline_bad_hash.yaml` | Wrong SHA-256: the build fails. |
 | `host_runtime.yaml` | `http_request` download from a local HTTP server. |
-| `host_runtime_bad_md5.yaml` | Manifest MD5 doesn't match: the download is rejected, nothing is sent. |
+| `host_runtime_bad_md5.yaml` | Manifest MD5 doesn't match: the image is rejected before `0x0A`, nothing is sent. |
+
+The fake MCU checks the start frame length, every offset, packet sizes and the end frame. `ONLY=<regex> tests/run.sh` runs a subset.
 
 It needs `esphome`, `socat`, `python3` and `libssl-dev`. CI runs it against the current ESPHome release and the current pre-release, and compiles `tests/esp32c3_runtime.yaml` for an ESP32-C3.
 

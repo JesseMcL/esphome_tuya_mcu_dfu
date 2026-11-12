@@ -1,0 +1,17 @@
+# Inline firmware pinned by URL and SHA-256 (run.sh serves build/ on
+# 127.0.0.1:8765 and fills in the hash), instead of a manifest.
+packages:
+  base: !include host.yaml
+
+substitutions:
+  name: tuya-mcu-dfu-test-inline-url
+
+update:
+  - id: !extend mcu_firmware
+    source: !remove
+    required: !remove
+    firmware:
+      url: http://127.0.0.1:8765/firmware.bin
+      version: 1.1.0
+      sha256: !include build/firmware.sha256
+      size: 5000

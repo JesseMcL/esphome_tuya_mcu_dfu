@@ -1,6 +1,8 @@
 """Tuya MCU firmware update entity.
 
-The release manifest (ESPHome style) and image come from `source`:
+The image comes from a release manifest (ESPHome style) in `source`, or, with
+fetch: build, from an inline `firmware:` block (url or path, version, hash).
+The manifest is fetched:
 
   fetch: build    (default) fetched when ESPHome compiles and embedded in the
                   binary. Works on every platform, including BK72xx
@@ -10,6 +12,7 @@ The release manifest (ESPHome style) and image come from `source`:
                   into RAM (up to `max_size`) and MD5-checked when you install.
 
 The update itself uses the standard Tuya MCU upgrade protocol (0x0A / 0x0B).
+The image's MD5 is checked on the device before anything is sent to the MCU.
 """
 import hashlib
 import json
@@ -23,9 +26,14 @@ from esphome.components import uart, update
 from esphome.components.tuya import CONF_TUYA_ID, Tuya
 import esphome.config_validation as cv
 from esphome.const import (
+    CONF_FILE,
+    CONF_PATH,
     CONF_RAW_DATA_ID,
+    CONF_SIZE,
     CONF_SOURCE,
     CONF_UPDATE_INTERVAL,
+    CONF_URL,
+    CONF_VERSION,
 )
 from esphome.core import CORE
 
@@ -45,6 +53,13 @@ CONF_RETRIES = "retries"
 CONF_FETCH = "fetch"
 CONF_HTTP_REQUEST_ID = "http_request_id"
 CONF_MAX_SIZE = "max_size"
+CONF_FIRMWARE = "firmware"
+CONF_MD5 = "md5"
+CONF_SHA256 = "sha256"
+CONF_TITLE = "title"
+CONF_SUMMARY = "summary"
+CONF_RELEASE_URL = "release_url"
+CONF_CHANNEL = "channel"
 
 FETCH_BUILD = "build"
 FETCH_RUNTIME = "runtime"
@@ -54,11 +69,8 @@ TuyaMcuDfu = tuya_mcu_dfu_ns.class_(
 )
 
 
-def AUTO_LOAD(config=None):
-    # MD5 of the downloaded image is checked on the device in runtime mode
-    if config is not None and config.get(CONF_FETCH) == FETCH_RUNTIME:
-        return ["md5"]
-    return []
+# The image's MD5 is checked on the device before every update
+AUTO_LOAD = ["md5"]
 
 
 def _source(value):
@@ -74,19 +86,56 @@ def _http_request_component():
     return HttpRequestComponent
 
 
+def _hex(n):
+    def validator(value):
+        value = cv.string_strict(value).strip().lower()
+        if len(value) != n or any(c not in "0123456789abcdef" for c in value):
+            raise cv.Invalid(f"expected {n} hex digits")
+        return value
+
+    return validator
+
+
+def _firmware(value):
+    value = cv.Schema(
+        {
+            cv.Exclusive(CONF_URL, CONF_FILE): cv.url,
+            # relative to the YAML
+            cv.Exclusive(CONF_PATH, CONF_FILE): cv.string_strict,
+            # what the MCU reports after the update
+            cv.Required(CONF_VERSION): cv.string_strict,
+            cv.Optional(CONF_MD5): _hex(32),
+            cv.Optional(CONF_SHA256): _hex(64),
+            cv.Optional(CONF_SIZE): cv.positive_not_null_int,
+            cv.Optional(CONF_TITLE, default=""): cv.string,
+            cv.Optional(CONF_SUMMARY, default=""): cv.string,
+            cv.Optional(CONF_RELEASE_URL, default=""): cv.string,
+        }
+    )(value)
+    if CONF_URL not in value and CONF_PATH not in value:
+        raise cv.Invalid("firmware needs url or path")
+    if CONF_URL in value and CONF_MD5 not in value and CONF_SHA256 not in value:
+        raise cv.Invalid("firmware from a url needs md5 or sha256, to pin the image")
+    return value
+
+
 _BASE = (
     update.update_schema(TuyaMcuDfu)
     .extend(
         {
             cv.GenerateID(CONF_TUYA_ID): cv.use_id(Tuya),
             # Release manifest: URL, or (build only) path relative to the YAML
-            cv.Required(CONF_SOURCE): _source,
+            cv.Optional(CONF_SOURCE): _source,
             # builds[].chipFamily to use; may be left out if there is one build
             cv.Optional(CONF_CHIP_FAMILY): cv.string,
+            # Firmware channel (type) in the 0x0A start frame. Tuya modules send
+            # the 8-byte form (size + channel) only for channels above 9; 0..9
+            # (or not set) send the size alone.
+            cv.Optional(CONF_CHANNEL): cv.uint8_t,
             # String DP in which the MCU reports its firmware version. Without
             # it, the "v" of the MCU's product information (0x01) is used.
             cv.Optional(CONF_VERSION_DATAPOINT): cv.uint8_t,
-            cv.Optional(CONF_START_TIMEOUT, default="8s"): cv.positive_time_period_milliseconds,
+            cv.Optional(CONF_START_TIMEOUT, default="5s"): cv.positive_time_period_milliseconds,
             cv.Optional(CONF_PACKET_TIMEOUT, default="5s"): cv.positive_time_period_milliseconds,
             cv.Optional(CONF_VERIFY_TIMEOUT, default="60s"): cv.positive_time_period_milliseconds,
             cv.Optional(CONF_RETRIES, default=3): cv.int_range(min=0, max=10),
@@ -109,6 +158,8 @@ def _runtime_schema(value):
         }
     )
     value = schema(value)
+    if CONF_SOURCE not in value:
+        raise cv.Invalid("fetch: runtime needs a source (manifest URL)")
     if not value[CONF_SOURCE].startswith(("http://", "https://")):
         raise cv.Invalid("fetch: runtime needs an http(s):// source", path=[CONF_SOURCE])
     return value
@@ -116,13 +167,18 @@ def _runtime_schema(value):
 
 CONFIG_SCHEMA = cv.typed_schema(
     {
-        FETCH_BUILD: _BASE.extend(
-            {
-                cv.GenerateID(CONF_RAW_DATA_ID): cv.declare_id(cg.uint8),
-                # Fail the build if the firmware can't be fetched (default:
-                # warn and build without firmware)
-                cv.Optional(CONF_REQUIRED, default=False): cv.boolean,
-            }
+        FETCH_BUILD: cv.All(
+            _BASE.extend(
+                {
+                    cv.GenerateID(CONF_RAW_DATA_ID): cv.declare_id(cg.uint8),
+                    # Image given directly instead of a manifest
+                    cv.Optional(CONF_FIRMWARE): _firmware,
+                    # Fail the build if the firmware can't be fetched (default:
+                    # warn and build without firmware). Always on with firmware:.
+                    cv.Optional(CONF_REQUIRED, default=False): cv.boolean,
+                }
+            ),
+            cv.has_exactly_one_key(CONF_SOURCE, CONF_FIRMWARE),
         ),
         FETCH_RUNTIME: _runtime_schema,
     },
@@ -164,18 +220,33 @@ def _pick_build(manifest: dict, chip_family: str | None, source: str) -> dict:
     raise cv.Invalid(f"No build for chipFamily '{chip_family}' in {source}")
 
 
+def _fetch_image(url: str, algo: str | None, digest: str | None) -> bytes:
+    """Image from url / path. With a digest, the download is cached by it and
+    must match it."""
+    cache = None
+    if digest is not None:
+        cache = Path(CORE.relative_internal_path("tuya_mcu_dfu")) / f"{algo}-{digest}.bin"
+        if cache.is_file() and hashlib.new(algo, cache.read_bytes()).hexdigest() == digest:
+            return cache.read_bytes()
+    data = _read(url)[0]
+    if digest is not None:
+        got = hashlib.new(algo, data).hexdigest()
+        if got != digest:
+            raise cv.Invalid(f"{algo.upper()} mismatch for {url}: expected {digest}, got {got}")
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_bytes(data)
+    return data
+
+
 def fetch_firmware(source: str, chip_family: str | None) -> dict:
     raw, loc = _read(source)
     manifest = json.loads(raw)
     ota = _pick_build(manifest, chip_family, source)["ota"]
     url = _join(loc, ota["path"])
     md5 = ota["md5"].lower()
-    cache = Path(CORE.relative_internal_path("tuya_mcu_dfu")) / (md5 + ".bin")
-    data = cache.read_bytes() if cache.is_file() else _read(url)[0]
-    if hashlib.md5(data).hexdigest() != md5:
-        raise cv.Invalid(f"MD5 mismatch for {url}")
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    cache.write_bytes(data)
+    data = _fetch_image(url, "md5", md5)
+    if "size" in ota and len(data) != int(ota["size"]):
+        raise cv.Invalid(f"{url} is {len(data)} bytes, the manifest says {ota['size']}")
     return {
         "data": data,
         "version": str(manifest["version"]),
@@ -184,6 +255,26 @@ def fetch_firmware(source: str, chip_family: str | None) -> dict:
         "release_url": ota.get("release_url", ""),
         "summary": ota.get("summary", ""),
         "url": url,
+    }
+
+
+def inline_firmware(fw: dict) -> dict:
+    src = fw.get(CONF_URL) or fw[CONF_PATH]
+    algo = next((a for a in ("sha256", "md5") if a in fw), None)
+    data = _fetch_image(src, algo, fw.get(algo))  # local path: hash optional
+    for other in ("sha256", "md5"):
+        if other in fw and hashlib.new(other, data).hexdigest() != fw[other]:
+            raise cv.Invalid(f"{other.upper()} mismatch for {src}")
+    if CONF_SIZE in fw and len(data) != fw[CONF_SIZE]:
+        raise cv.Invalid(f"{src} is {len(data)} bytes, expected {fw[CONF_SIZE]}")
+    return {
+        "data": data,
+        "version": fw[CONF_VERSION],
+        "title": fw[CONF_TITLE],
+        "md5": hashlib.md5(data).hexdigest(),
+        "release_url": fw[CONF_RELEASE_URL],
+        "summary": fw[CONF_SUMMARY],
+        "url": src,
     }
 
 
@@ -198,6 +289,8 @@ async def to_code(config):
         cg.add(var.set_version_datapoint(config[CONF_VERSION_DATAPOINT]))
     cg.add(var.set_timeouts(config[CONF_START_TIMEOUT], config[CONF_PACKET_TIMEOUT],
                             config[CONF_VERIFY_TIMEOUT], config[CONF_RETRIES]))
+    if CONF_CHANNEL in config:
+        cg.add(var.set_channel(config[CONF_CHANNEL]))
 
     if config[CONF_FETCH] == FETCH_RUNTIME:
         cg.add_define("USE_TUYA_MCU_DFU_RUNTIME")
@@ -209,13 +302,20 @@ async def to_code(config):
         cg.add(var.set_check_interval(config[CONF_UPDATE_INTERVAL]))
         return
 
-    try:
-        fw = fetch_firmware(config[CONF_SOURCE], config.get(CONF_CHIP_FAMILY))
-    except Exception as err:  # noqa: BLE001
-        if config[CONF_REQUIRED]:
-            raise cv.Invalid(f"tuya_mcu_dfu: could not fetch MCU firmware: {err}") from err
-        _LOGGER.warning("tuya_mcu_dfu: no MCU firmware bundled (%s): %s", config[CONF_SOURCE], err)
-        return
+    if CONF_FIRMWARE in config:
+        # Pinned image: any failure or mismatch fails the build
+        try:
+            fw = inline_firmware(config[CONF_FIRMWARE])
+        except Exception as err:  # noqa: BLE001
+            raise cv.Invalid(f"tuya_mcu_dfu: MCU firmware: {err}") from err
+    else:
+        try:
+            fw = fetch_firmware(config[CONF_SOURCE], config.get(CONF_CHIP_FAMILY))
+        except Exception as err:  # noqa: BLE001
+            if config[CONF_REQUIRED]:
+                raise cv.Invalid(f"tuya_mcu_dfu: could not fetch MCU firmware: {err}") from err
+            _LOGGER.warning("tuya_mcu_dfu: no MCU firmware bundled (%s): %s", config[CONF_SOURCE], err)
+            return
 
     _LOGGER.info("tuya_mcu_dfu: bundling MCU firmware %s (%d bytes) from %s",
                  fw["version"], len(fw["data"]), fw["url"])

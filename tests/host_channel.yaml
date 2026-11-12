@@ -1,0 +1,11 @@
+# As host.yaml, with firmware channel 10: the 0x0A start frame is the 8-byte
+# form (size + channel + 3 zero bytes), as a Tuya module sends for channels > 9.
+packages:
+  base: !include host.yaml
+
+substitutions:
+  name: tuya-mcu-dfu-test-channel
+
+update:
+  - id: !extend mcu_firmware
+    channel: 10

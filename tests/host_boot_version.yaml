@@ -1,0 +1,13 @@
+# No version DP: the installed version comes from the product information
+# query after tuya: initialises. The MCU already runs the release, so no
+# update is offered. The check waits until the query has run.
+packages:
+  base: !include host.yaml
+
+substitutions:
+  name: tuya-mcu-dfu-test-boot-version
+  check_delay: 8s
+
+update:
+  - id: !extend mcu_firmware
+    version_datapoint: !remove

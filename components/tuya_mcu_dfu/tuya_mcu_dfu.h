@@ -30,6 +30,11 @@ namespace esphome::tuya_mcu_dfu {
 /// code that writes datapoints should hold off meanwhile). Afterwards `tuya:`
 /// resumes and re-initialises with the restarted MCU.
 ///
+/// The installed version is read from the MCU's product information (0x01):
+/// each time `tuya:` finishes initialising, this component borrows the UART
+/// for one query (a fraction of a second). Datapoint reports the MCU sends in
+/// that window are recovered with a status query (0x08) afterwards.
+///
 /// The image is either bundled at build time (set_firmware) or, with
 /// USE_TUYA_MCU_DFU_RUNTIME, downloaded with http_request when installing.
 class TuyaMcuDfu : public update::UpdateEntity, public Component, public uart::UARTDevice {
@@ -64,10 +69,10 @@ class TuyaMcuDfu : public update::UpdateEntity, public Component, public uart::U
   void perform(bool force) override;
   void check() override;
 
-  bool is_updating() const { return this->phase_ != Phase::IDLE; }
+  bool is_updating() const { return this->phase_ != Phase::IDLE && this->phase_ != Phase::QUERY; }
 
  protected:
-  enum class Phase : uint8_t { IDLE, START, DATA, FINISH, VERIFY };
+  enum class Phase : uint8_t { IDLE, START, DATA, FINISH, VERIFY, QUERY };
 
   bool has_release_() const { return !this->fw_version_.empty(); }
   void refresh_state_();
@@ -75,6 +80,14 @@ class TuyaMcuDfu : public update::UpdateEntity, public Component, public uart::U
   void verified_(const char *how);
   void release_uart_(bool poke);
   void send_frame_(uint8_t cmd, const uint8_t *payload, size_t len);
+  bool flush_tx_();
+  void schedule_version_query_();
+  void begin_version_query_();
+  void end_version_query_();
+  void watch_reinit_();
+  uint8_t wifi_status_code_() const;
+  void resync_tuya_();
+  void on_heartbeat_(const uint8_t *data, size_t len);
   void send_start_();
   void send_packet_();
   void send_end_();
@@ -110,7 +123,19 @@ class TuyaMcuDfu : public update::UpdateEntity, public Component, public uart::U
   uint8_t offset_width_{4};  ///< 4, or 2 if the MCU's 0x0A reply has frame version 0
   uint16_t last_len_{0};
   uint8_t tries_{0};
-  uint32_t sent_at_{0};
+  uint32_t sent_at_{0};          ///< when the last frame finished going out
+  std::vector<uint8_t> tx_;       ///< frame being written (large frames go out over several loops)
+  size_t tx_pos_{0};
+  bool probe_sent_{false};        ///< START: heartbeat sent to see if a bootloader runs
+  bool restarted_seen_{false};    ///< START: "first heartbeat" (0x00 [00]) already acted on
+  bool collided_{false};          ///< DATA: a heartbeat reply came instead of the ack
+  uint8_t last_rx_ver_{0};        ///< protocol version of the MCU's last frame
+  uint8_t query_tries_{0};
+  bool swallowed_dp_{false};      ///< QUERY: a datapoint report arrived while tuya: was paused
+  bool restart_unseen_{false};    ///< the MCU restarted, but tuya: was paused and didn't see it
+  uint8_t reinit_ticks_{0};
+  uint8_t reinit_wifi_seen_{0};
+  bool reinit_begun_{false};      ///< tuya: has started re-initialising since the watch began
   uint32_t verify_start_{0};
   bool product_seen_{false};
   float last_published_progress_{-1};

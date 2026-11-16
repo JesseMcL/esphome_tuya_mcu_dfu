@@ -4,12 +4,15 @@
 
 #include "esphome/core/hal.h"
 #include "esphome/core/log.h"
+#include "esphome/core/util.h"
 #include "esphome/components/md5/md5.h"
 
+#ifdef USE_NETWORK
+#include "esphome/components/network/util.h"
+#endif
 #ifdef USE_TUYA_MCU_DFU_RUNTIME
 #include "esphome/core/application.h"
 #include "esphome/components/json/json_util.h"
-#include "esphome/components/network/util.h"
 #endif
 
 namespace esphome::tuya_mcu_dfu {
@@ -18,6 +21,9 @@ static const char *const TAG = "tuya_mcu_dfu";
 
 static constexpr uint8_t CMD_HEARTBEAT = 0x00;
 static constexpr uint8_t CMD_PRODUCT = 0x01;
+static constexpr uint8_t CMD_WIFI_STATE = 0x03;
+static constexpr uint8_t CMD_DP_REPORT = 0x07;
+static constexpr uint8_t CMD_DP_QUERY = 0x08;
 static constexpr uint8_t CMD_OTA_START = 0x0A;
 static constexpr uint8_t CMD_OTA_DATA = 0x0B;
 static constexpr size_t MAX_RX = 512;                 // product info JSON can be a few hundred bytes
@@ -26,6 +32,14 @@ static constexpr uint16_t PACKET_SIZES[] = {256, 512, 1024, 2048, 3072, 4096};
 static constexpr uint32_t END_ACK_TIMEOUT = 1500;     // the end frame needn't be acknowledged
 static constexpr uint32_t PRODUCT_QUERY_INTERVAL = 1000;
 static constexpr uint32_t PRODUCT_WINDOW = 10000;     // then fall back to the version DP
+static constexpr size_t TX_DIRECT = 32;               // smaller frames are written in one go
+static constexpr size_t TX_CHUNK = 16;                // bytes per loop() when the UART can't say how many fit
+static constexpr uint32_t PROBE_DELAY = 1000;         // START: heartbeat probe this long after an unanswered 0x0A
+static constexpr uint32_t COLLISION_GRACE = 1000;     // DATA: ack wait after a heartbeat reply crossed a packet
+static constexpr uint32_t QUERY_DELAY = 2000;         // after tuya: initialised, before the version query
+static constexpr uint32_t QUERY_TIMEOUT = 1000;
+static constexpr uint8_t QUERY_TRIES = 2;
+static constexpr uint8_t REINIT_TICKS = 30;           // seconds to watch tuya: re-initialise
 
 // ---------------------------------------------------------------------------
 // Setup / state
@@ -45,6 +59,9 @@ void TuyaMcuDfu::set_firmware(const uint8_t *data, size_t len, const char *versi
 }
 
 void TuyaMcuDfu::setup() {
+  // Read the MCU's version whenever tuya: has (re)initialised with it: at
+  // boot, and after the MCU restarts (an update, a power glitch).
+  this->parent_->add_on_initialized_callback([this]() { this->schedule_version_query_(); });
   if (this->has_version_dp_) {
     this->parent_->register_listener(this->version_dp_, [this](const tuya::TuyaDatapoint &dp) {
       if (dp.type != tuya::TuyaDatapointType::STRING)
@@ -74,7 +91,7 @@ void TuyaMcuDfu::dump_config() {
   if (this->has_version_dp_) {
     ESP_LOGCONFIG(TAG, "  Version datapoint: %u", this->version_dp_);
   } else {
-    ESP_LOGCONFIG(TAG, "  Version datapoint: none (product information is used to verify)");
+    ESP_LOGCONFIG(TAG, "  Version datapoint: none (product information is used)");
   }
 #ifdef USE_TUYA_MCU_DFU_RUNTIME
   ESP_LOGCONFIG(TAG, "  Source (runtime): %s", this->source_url_);
@@ -140,6 +157,8 @@ void TuyaMcuDfu::perform(bool force) {
   }
   if (this->state_ != update::UPDATE_STATE_AVAILABLE && !force)
     return;
+  if (this->phase_ == Phase::QUERY)
+    this->end_version_query_();
 #ifdef USE_TUYA_MCU_DFU_RUNTIME
   if (!this->download_image_()) {
     this->status_set_error(LOG_STR("MCU firmware download failed"));
@@ -190,7 +209,9 @@ void TuyaMcuDfu::begin_transfer_() {
            this->update_info_.current_version.empty() ? "?" : this->update_info_.current_version.c_str(),
            this->fw_version_.c_str(), (unsigned) this->fw_len_);
   // Take the UART: tuya: would otherwise read (and drop) the MCU's replies.
-  // Its scheduler-driven heartbeat still goes out; the MCU's answer is ignored.
+  // Its scheduler-driven heartbeat still goes out; the replies are handled
+  // here (see on_heartbeat_).
+  this->cancel_interval("reinit");
   this->parent_->disable_loop();
   this->state_ = update::UPDATE_STATE_INSTALLING;
   this->update_info_.has_progress = true;
@@ -200,6 +221,11 @@ void TuyaMcuDfu::begin_transfer_() {
   this->tries_ = 0;
   this->packet_size_ = 256;
   this->offset_width_ = 4;
+  this->probe_sent_ = false;
+  this->restarted_seen_ = false;
+  this->collided_ = false;
+  this->tx_.clear();
+  this->tx_pos_ = 0;
   this->phase_ = Phase::START;
   this->high_freq_.start();
   this->enable_loop();
@@ -218,19 +244,53 @@ void TuyaMcuDfu::set_progress_(float p) {
   }
 }
 
+// Frames are written whole when small. A large frame (a data packet: up to
+// 4 KiB, over 4 s at 9600 baud) goes out a chunk per loop() so the main loop
+// isn't blocked. Timeouts count from when its last byte was written.
 void TuyaMcuDfu::send_frame_(uint8_t cmd, const uint8_t *payload, size_t len) {
-  uint8_t hdr[6] = {0x55, 0xAA, 0x00, cmd, (uint8_t) (len >> 8), (uint8_t) len};
+  std::vector<uint8_t> f;
+  f.reserve(len + 7);
+  f.insert(f.end(), {0x55, 0xAA, 0x00, cmd, (uint8_t) (len >> 8), (uint8_t) len});
+  if (len != 0)
+    f.insert(f.end(), payload, payload + len);
   uint8_t sum = 0;
-  for (uint8_t b : hdr)
+  for (uint8_t b : f)
     sum += b;
-  this->write_array(hdr, sizeof(hdr));
-  for (size_t i = 0; i < len; i++) {
-    uint8_t b = payload[i];
-    sum += b;
-    this->write_byte(b);
+  f.push_back(sum);
+  if (f.size() <= TX_DIRECT || this->tx_pos_ < this->tx_.size()) {
+    // small, or something is still going out: never interleave frames
+    if (this->tx_pos_ < this->tx_.size()) {
+      this->tx_.insert(this->tx_.end(), f.begin(), f.end());
+      return;
+    }
+    this->write_array(f.data(), f.size());
+    this->sent_at_ = millis();
+    return;
   }
-  this->write_byte(sum);
+  this->tx_ = std::move(f);
+  this->tx_pos_ = 0;
+  this->enable_loop();
+  this->flush_tx_();
+}
+
+// Write what fits of the pending frame. True once nothing is pending.
+bool TuyaMcuDfu::flush_tx_() {
+  if (this->tx_pos_ >= this->tx_.size())
+    return true;
+  size_t room = this->uart::UARTDevice::parent_->available_for_write();
+  if (room == SIZE_MAX)
+    room = TX_CHUNK;  // the platform can't tell: write a little at a time
+  size_t n = std::min(room, this->tx_.size() - this->tx_pos_);
+  if (n == 0)
+    return false;
+  this->write_array(this->tx_.data() + this->tx_pos_, n);
+  this->tx_pos_ += n;
+  if (this->tx_pos_ < this->tx_.size())
+    return false;
+  this->tx_.clear();
+  this->tx_pos_ = 0;
   this->sent_at_ = millis();
+  return true;
 }
 
 void TuyaMcuDfu::send_start_() {
@@ -278,6 +338,7 @@ void TuyaMcuDfu::finish_transfer_() {
   // As the Tuya spec: ask for product information until the MCU answers with
   // its new version. tuya: stays suspended so we see the reply.
   this->phase_ = Phase::VERIFY;
+  this->restart_unseen_ = false;
   this->verify_start_ = millis();
   this->product_seen_ = false;
   this->rx_.clear();
@@ -291,8 +352,69 @@ void TuyaMcuDfu::release_uart_(bool poke) {
   this->parent_->enable_loop();
   // Don't wait up to 15 s for tuya:'s next heartbeat: a restarted MCU answers
   // this one with "first heartbeat", which makes tuya: re-initialise now.
-  if (poke)
+  if (this->restart_unseen_) {
+    // The MCU's "first heartbeat" went to us, so tuya: won't re-initialise
+    // with it. Do what that would: Wi-Fi status, then all datapoints.
+    this->restart_unseen_ = false;
+    this->set_timeout("hb", 300, [this]() { this->resync_tuya_(); });
+  } else if (poke) {
     this->set_timeout("hb", 300, [this]() { this->send_frame_(CMD_HEARTBEAT, nullptr, 0); });
+    this->watch_reinit_();
+  }
+}
+
+uint8_t TuyaMcuDfu::wifi_status_code_() const {
+  // as tuya: reports it
+  uint8_t status = 0x02;
+#ifdef USE_NETWORK
+  if (network::is_connected())
+    status = this->last_rx_ver_ >= 3 && remote_is_connected() ? 0x04 : 0x03;
+#endif
+  return status;
+}
+
+void TuyaMcuDfu::resync_tuya_() {
+  uint8_t status = this->wifi_status_code_();
+  ESP_LOGD(TAG, "MCU restarted while tuya: was paused; sending Wi-Fi status 0x%02X and requesting datapoints", status);
+  this->send_frame_(CMD_WIFI_STATE, &status, 1);
+  this->set_timeout("resync", 200, [this]() { this->send_frame_(CMD_DP_QUERY, nullptr, 0); });
+}
+
+// tuya: re-initialising after an MCU restart stops at the Wi-Fi status step:
+// it only sends the Wi-Fi state when that state changes, and it hasn't. Send
+// it on its behalf; the MCU's acknowledgement (0x03) moves tuya: on.
+void TuyaMcuDfu::watch_reinit_() {
+  this->reinit_ticks_ = 0;
+  this->reinit_wifi_seen_ = 0;
+  this->reinit_begun_ = false;
+  this->set_interval("reinit", 1000, [this]() {
+    if (this->phase_ != Phase::IDLE && this->phase_ != Phase::QUERY) {
+      this->cancel_interval("reinit");
+      return;
+    }
+    auto st = this->parent_->get_init_state();
+    if (++this->reinit_ticks_ > REINIT_TICKS) {
+      this->cancel_interval("reinit");
+      return;
+    }
+    if (st == tuya::TuyaInitState::INIT_DONE) {
+      // done - unless the restart hasn't reached tuya: yet: keep watching
+      // until it has started over (or the time is up)
+      if (this->reinit_begun_)
+        this->cancel_interval("reinit");
+      return;
+    }
+    this->reinit_begun_ = true;
+    if (st != tuya::TuyaInitState::INIT_WIFI) {
+      this->reinit_wifi_seen_ = 0;
+      return;
+    }
+    if (++this->reinit_wifi_seen_ < 2)
+      return;  // give tuya: a second to send it itself
+    uint8_t status = this->wifi_status_code_();
+    ESP_LOGD(TAG, "tuya: is waiting at the Wi-Fi status step; sending status 0x%02X", status);
+    this->send_frame_(CMD_WIFI_STATE, &status, 1);
+  });
 }
 
 void TuyaMcuDfu::verified_(const char *how) {
@@ -361,6 +483,30 @@ void TuyaMcuDfu::on_frame_(uint8_t ver, uint8_t cmd, const uint8_t *data, size_t
   ESP_LOGV(TAG, "<- ver %u cmd 0x%02X len %u [%s]", ver, cmd, (unsigned) len,
            format_hex_pretty_to(hex, data, len > 16 ? 16 : len));
 #endif
+  this->last_rx_ver_ = ver;
+  if (cmd == CMD_HEARTBEAT) {
+    this->on_heartbeat_(data, len);
+    return;
+  }
+  if (this->phase_ == Phase::QUERY) {
+    if (cmd == CMD_PRODUCT) {
+      std::string v;
+      if (product_version(data, len, v)) {
+        if (v != this->update_info_.current_version) {
+          ESP_LOGI(TAG, "MCU firmware version: %s (product information)", v.c_str());
+        } else {
+          ESP_LOGD(TAG, "MCU firmware version: %s (product information)", v.c_str());
+        }
+        this->update_info_.current_version = v;
+      } else {
+        ESP_LOGD(TAG, "The MCU's product information has no version");
+      }
+      this->end_version_query_();
+    } else if (cmd == CMD_DP_REPORT) {
+      this->swallowed_dp_ = true;  // tuya: missed it; recovered after the query
+    }
+    return;
+  }
   if (this->phase_ == Phase::START && cmd == CMD_OTA_START) {
     uint8_t code = len >= 1 ? data[0] : 0;
     if (code >= sizeof(PACKET_SIZES) / sizeof(PACKET_SIZES[0])) {
@@ -382,6 +528,7 @@ void TuyaMcuDfu::on_frame_(uint8_t ver, uint8_t cmd, const uint8_t *data, size_t
   } else if (this->phase_ == Phase::DATA && cmd == CMD_OTA_DATA) {
     this->offset_ += this->last_len_;
     this->tries_ = 0;
+    this->collided_ = false;
     this->set_progress_(100.0f * this->offset_ / this->fw_len_);
     if (this->offset_ >= this->fw_len_) {
       this->phase_ = Phase::FINISH;
@@ -394,7 +541,92 @@ void TuyaMcuDfu::on_frame_(uint8_t ver, uint8_t cmd, const uint8_t *data, size_t
   } else if (this->phase_ == Phase::VERIFY && cmd == CMD_PRODUCT) {
     this->on_product_(data, len);
   }
-  // anything else (heartbeat replies etc.) is ignored while we own the UART
+  // anything else is ignored while we own the UART
+}
+
+// tuya:'s heartbeat keeps running while we own the UART; its replies land here.
+void TuyaMcuDfu::on_heartbeat_(const uint8_t *data, size_t len) {
+  const bool first = len >= 1 && data[0] == 0x00;
+  switch (this->phase_) {
+    case Phase::START:
+      // "First heartbeat since reset": the application reset on our 0x0A and
+      // its bootloader is listening now. Ask again without waiting out the
+      // timeout (once: a further reset would mean something else is wrong).
+      if (first && !this->restarted_seen_ && this->tries_ < this->retries_) {
+        this->restarted_seen_ = true;
+        ESP_LOGD(TAG, "MCU restarted, sending start again");
+        this->tries_++;
+        this->send_start_();
+      }
+      break;
+    case Phase::DATA:
+    case Phase::FINISH:
+      // A heartbeat crossed our packet. The MCU may have dropped the packet;
+      // don't wait the full packet timeout for an ack that may never come.
+      if (!this->collided_ && this->tx_pos_ >= this->tx_.size()) {
+        this->collided_ = true;
+        const uint32_t now = millis();
+        const uint32_t timeout = this->phase_ == Phase::FINISH ? END_ACK_TIMEOUT : this->packet_timeout_;
+        if (timeout > COLLISION_GRACE && now - this->sent_at_ < timeout - COLLISION_GRACE) {
+          ESP_LOGD(TAG, "Heartbeat crossed a packet; waiting %" PRIu32 " ms for its ack", COLLISION_GRACE);
+          this->sent_at_ = now - (timeout - COLLISION_GRACE);
+        }
+      }
+      break;
+    case Phase::VERIFY:
+    case Phase::QUERY:
+      if (first)
+        this->restart_unseen_ = true;  // tuya: would have re-initialised on this
+      break;
+    default:
+      break;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Installed version: product information (0x01) after tuya: initialises
+// ---------------------------------------------------------------------------
+
+void TuyaMcuDfu::schedule_version_query_() {
+  // Let tuya: finish what it sends right after initialising (restored
+  // datapoint values, time) before borrowing the UART.
+  this->set_timeout("query", QUERY_DELAY, [this]() { this->begin_version_query_(); });
+}
+
+void TuyaMcuDfu::begin_version_query_() {
+  if (this->phase_ != Phase::IDLE)
+    return;  // updating or verifying: that reads the version itself
+  if (this->parent_->get_init_state() != tuya::TuyaInitState::INIT_DONE || this->parent_->is_idle())
+    return;
+  ESP_LOGV(TAG, "Querying the MCU's version");
+  this->parent_->disable_loop();
+  this->phase_ = Phase::QUERY;
+  this->rx_.clear();
+  this->query_tries_ = 1;
+  this->swallowed_dp_ = false;
+  this->restart_unseen_ = false;
+  this->high_freq_.start();
+  this->enable_loop();
+  this->send_product_query_();
+}
+
+void TuyaMcuDfu::end_version_query_() {
+  this->phase_ = Phase::IDLE;
+  this->high_freq_.stop();
+  this->rx_.clear();
+  if (this->parent_->is_idle())
+    this->parent_->enable_loop();
+  if (this->restart_unseen_) {
+    this->restart_unseen_ = false;
+    this->swallowed_dp_ = false;
+    this->resync_tuya_();
+  } else if (this->swallowed_dp_) {
+    // tuya: was paused when the MCU reported a datapoint: ask for all of them
+    ESP_LOGD(TAG, "Datapoint report arrived during the version query; requesting a status update");
+    this->swallowed_dp_ = false;
+    this->send_frame_(CMD_DP_QUERY, nullptr, 0);
+  }
+  this->refresh_state_();
 }
 
 void TuyaMcuDfu::poll_uart_() {
@@ -442,10 +674,35 @@ void TuyaMcuDfu::loop() {
     this->poll_uart_();
   if (this->phase_ == Phase::IDLE)
     return;
+  if (!this->flush_tx_())
+    return;  // timeouts start once the frame is out
   const uint32_t now = millis();  // after poll: a reply may just have re-armed sent_at_
 
   switch (this->phase_) {
+    case Phase::QUERY:
+      if (now - this->sent_at_ < QUERY_TIMEOUT)
+        return;
+      if (this->query_tries_++ >= QUERY_TRIES) {
+        ESP_LOGD(TAG, "The MCU didn't answer the product query");
+        this->end_version_query_();
+        return;
+      }
+      this->rx_.clear();
+      this->send_product_query_();
+      return;
+
     case Phase::START:
+      // The application doesn't answer 0x0A when it hands over to a
+      // bootloader. A heartbeat tells whether the MCU has restarted.
+      if (!this->probe_sent_ && !this->restarted_seen_ && now - this->sent_at_ >= PROBE_DELAY &&
+          now - this->sent_at_ < this->start_timeout_) {
+        this->probe_sent_ = true;
+        uint32_t sent = this->sent_at_;
+        this->send_frame_(CMD_HEARTBEAT, nullptr, 0);
+        this->sent_at_ = sent;  // the start timeout still counts from the 0x0A
+        return;
+      }
+      [[fallthrough]];
     case Phase::DATA:
     case Phase::FINISH: {
       uint32_t timeout = this->phase_ == Phase::START    ? this->start_timeout_
@@ -462,7 +719,12 @@ void TuyaMcuDfu::loop() {
                                                  : "MCU stopped acknowledging data packets");
         return;
       }
-      ESP_LOGW(TAG, "No reply from MCU, retrying (%u/%u)", this->tries_, this->retries_);
+      if (this->collided_)
+        ESP_LOGD(TAG, "No ack after a heartbeat crossed the packet; sending it again (%u/%u)", this->tries_,
+                 this->retries_);
+      else
+        ESP_LOGW(TAG, "No reply from MCU, retrying (%u/%u)", this->tries_, this->retries_);
+      this->collided_ = false;
       this->rx_.clear();
       while (this->available()) {  // drop anything stale so a late ack can't be miscounted
         uint8_t c;

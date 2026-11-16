@@ -1,0 +1,8 @@
+# As host.yaml, but the update starts only once tuya: has initialised, so the
+# MCU restart afterwards is a real re-initialisation (run with --real-reinit).
+packages:
+  base: !include host.yaml
+
+substitutions:
+  name: tuya-mcu-dfu-test-reinit
+  check_delay: 8s

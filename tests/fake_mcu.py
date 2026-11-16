@@ -7,7 +7,8 @@ datapoint, and accepts a firmware update (0x0A / 0x0B). After the update it
 
   fake_mcu.py TTY --version 1.0.0 --new-version 1.1.0 --expect firmware.bin
       [--pkt-code 0..5] [--ota-version V] [--ignore-first-start]
-      [--expect-channel C]
+      [--expect-channel C] [--real-reinit] [--drop-packet N]
+      [--report-during-query] [--slow-restart]
 
 --pkt-code      packet size code in the 0x0A reply (256 .. 4096 bytes)
 --ota-version   frame version byte of the 0x0A reply; 0 = 16-bit offsets
@@ -16,6 +17,18 @@ datapoint, and accepts a firmware update (0x0A / 0x0B). After the update it
                 into its bootloader, which answers the retry)
 --expect-channel
                 the 0x0A must be the 8-byte form with this channel
+--real-reinit   don't send the unsolicited 0x03/0x2B after 0x02 (the
+                workaround in the README): like a stock MCU, wait for the
+                module's Wi-Fi status. ESPHome's tuya: only sends it when it
+                changes, so after a restart the component has to.
+--drop-packet N don't acknowledge data packet N (1-based); answer as if a
+                heartbeat had crossed it instead
+--report-during-query
+                send a datapoint report just before answering the second
+                product query (the component's, while tuya: is paused)
+--slow-restart  after an update, don't answer product queries until a
+                heartbeat has been answered: the "first heartbeat" reply then
+                goes to the component (tuya: is paused while it verifies)
 """
 import argparse
 import os
@@ -44,6 +57,9 @@ class Mcu:
         self.size = 0
         self.width = 4
         self.starts = 0
+        self.packets = 0
+        self.products = 0
+        self.restarting = False
         self.errors = []
 
     def send(self, cmd, data=b"", ver=0x03):
@@ -58,20 +74,32 @@ class Mcu:
         if cmd == HEARTBEAT:
             self.send(HEARTBEAT, b"\x00" if self.first_hb else b"\x01")
             self.first_hb = False
+            self.restarting = False
         elif cmd == PRODUCT:
+            if self.restarting:
+                return
+            self.products += 1
+            if self.a.report_during_query and self.products == 2:
+                log("datapoint report during the product query")
+                self.report_version()
             self.send(PRODUCT, b'{"p":"fake","v":"%s","m":0}' % self.version.encode())
         elif cmd == CONF:
             self.send(CONF)
-            self.send(WIFI_STATE)       # see the ESPHome re-init note in README
-            self.send(NET_STATUS)
+            if not self.a.real_reinit:
+                self.send(WIFI_STATE)       # see the ESPHome re-init note in README
+                self.send(NET_STATUS)
         elif cmd == WIFI_STATE:
+            log("wifi state", data.hex())
             self.send(WIFI_STATE)
         elif cmd in (DP_QUERY, DP_DELIVER):
+            if cmd == DP_QUERY:
+                log("status query")
             self.report_version()
         elif cmd == OTA_START:
             self.starts += 1
             if self.a.ignore_first_start and self.starts == 1:
                 log("start ignored (resetting into the bootloader)")
+                self.first_hb = True              # the bootloader just started
                 return
             want = 4 if self.a.expect_channel is None else 8
             if len(data) != want or (want == 8 and (data[4] != self.a.expect_channel or data[5:8] != b"\0\0\0")):
@@ -91,6 +119,11 @@ class Mcu:
                 return
             if len(data) - w > PACKET_SIZES[self.a.pkt_code]:
                 self.errors.append("packet of %d bytes" % (len(data) - w))
+            self.packets += 1
+            if self.packets == self.a.drop_packet:
+                log("packet %d dropped (a heartbeat crossed it)" % self.packets)
+                self.send(HEARTBEAT, b"\x01")
+                return
             if off == len(self.image):
                 self.image += data[w:]
             else:
@@ -106,6 +139,7 @@ class Mcu:
         if ok:
             self.version = self.new_version
             self.first_hb = True                  # "restarted"
+            self.restarting = self.a.slow_restart
             log("restarted with version", self.version)
 
 
@@ -120,6 +154,10 @@ def main():
     ap.add_argument("--ota-version", type=int, default=3)
     ap.add_argument("--ignore-first-start", action="store_true")
     ap.add_argument("--expect-channel", type=int)
+    ap.add_argument("--real-reinit", action="store_true")
+    ap.add_argument("--drop-packet", type=int, default=0)
+    ap.add_argument("--report-during-query", action="store_true")
+    ap.add_argument("--slow-restart", action="store_true")
     a = ap.parse_args()
 
     fd = os.open(a.tty, os.O_RDWR | os.O_NOCTTY)

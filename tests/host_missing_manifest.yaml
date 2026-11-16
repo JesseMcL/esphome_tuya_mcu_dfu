@@ -1,0 +1,10 @@
+# fetch: build with a manifest that doesn't exist: the build must fail.
+packages:
+  base: !include host.yaml
+
+substitutions:
+  name: tuya-mcu-dfu-test-missing
+
+update:
+  - id: !extend mcu_firmware
+    source: build/nonexistent/manifest.json

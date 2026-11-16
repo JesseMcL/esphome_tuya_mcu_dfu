@@ -1,0 +1,10 @@
+# fetch: build, no build for this chip_family: the build must fail.
+packages:
+  base: !include host.yaml
+
+substitutions:
+  name: tuya-mcu-dfu-test-chip-family
+
+update:
+  - id: !extend mcu_firmware
+    chip_family: NOT-IN-MANIFEST

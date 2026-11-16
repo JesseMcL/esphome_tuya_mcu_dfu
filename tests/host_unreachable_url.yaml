@@ -1,0 +1,11 @@
+# fetch: build with a manifest URL that doesn't resolve to a file: the build
+# must fail.
+packages:
+  base: !include host.yaml
+
+substitutions:
+  name: tuya-mcu-dfu-test-unreachable
+
+update:
+  - id: !extend mcu_firmware
+    source: http://127.0.0.1:8765/nonexistent/manifest.json

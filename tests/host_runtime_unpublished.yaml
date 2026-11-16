@@ -1,0 +1,11 @@
+# fetch: runtime with a release that isn't published (yet): the build only
+# warns. (Checked with `esphome config`, no compile needed.)
+packages:
+  base: !include host_runtime.yaml
+
+substitutions:
+  name: tuya-mcu-dfu-test-unpublished
+
+update:
+  - id: !extend mcu_firmware
+    source: http://127.0.0.1:8765/unpublished/manifest.json

@@ -6,10 +6,15 @@ The manifest is fetched:
 
   fetch: build    (default) fetched when ESPHome compiles and embedded in the
                   binary. Works on every platform, including BK72xx
-                  (LibreTiny), which has no `http_request`.
+                  (LibreTiny), which has no `http_request`. Anything wrong with
+                  the source (missing, unreachable, bad manifest, hash or size
+                  mismatch) fails the build: a device without its image is
+                  never built.
   fetch: runtime  fetched by the device with `http_request`: the manifest is
                   checked every `update_interval`, the image is downloaded
                   into RAM (up to `max_size`) and MD5-checked when you install.
+                  The build checks the manifest and image if it can reach
+                  them, and only warns: the release may be published later.
 
 The update itself uses the standard Tuya MCU upgrade protocol (0x0A / 0x0B).
 The image's MD5 is checked on the device before anything is sent to the MCU.
@@ -27,6 +32,7 @@ from esphome.components.tuya import CONF_TUYA_ID, Tuya
 import esphome.config_validation as cv
 from esphome.const import (
     CONF_FILE,
+    CONF_ID,
     CONF_PATH,
     CONF_RAW_DATA_ID,
     CONF_SIZE,
@@ -45,7 +51,6 @@ DEPENDENCIES = ["tuya", "uart"]
 
 CONF_VERSION_DATAPOINT = "version_datapoint"
 CONF_CHIP_FAMILY = "chip_family"
-CONF_REQUIRED = "required"
 CONF_PACKET_TIMEOUT = "packet_timeout"
 CONF_START_TIMEOUT = "start_timeout"
 CONF_VERIFY_TIMEOUT = "verify_timeout"
@@ -165,39 +170,34 @@ def _runtime_schema(value):
     return value
 
 
-CONFIG_SCHEMA = cv.typed_schema(
-    {
-        FETCH_BUILD: cv.All(
-            _BASE.extend(
-                {
-                    cv.GenerateID(CONF_RAW_DATA_ID): cv.declare_id(cg.uint8),
-                    # Image given directly instead of a manifest
-                    cv.Optional(CONF_FIRMWARE): _firmware,
-                    # Fail the build if the firmware can't be fetched (default:
-                    # warn and build without firmware). Always on with firmware:.
-                    cv.Optional(CONF_REQUIRED, default=False): cv.boolean,
-                }
-            ),
-            cv.has_exactly_one_key(CONF_SOURCE, CONF_FIRMWARE),
-        ),
-        FETCH_RUNTIME: _runtime_schema,
-    },
-    key=CONF_FETCH,
-    default_type=FETCH_BUILD,
-    lower=True,
-)
+
+
+class SourceError(Exception):
+    """The firmware source can't be used (missing, unreachable, malformed or
+    not matching its hash/size)."""
 
 
 def _read(src: str) -> tuple[bytes, str]:
     """Return (content, resolved location) for a URL or a file path."""
     if src.startswith(("http://", "https://")):
         req = urllib.request.Request(src, headers={"User-Agent": "esphome-tuya_mcu_dfu"})
-        with urllib.request.urlopen(req, timeout=30) as r:  # follows redirects
-            return r.read(), src
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:  # follows redirects
+                return r.read(), src
+        except Exception as err:  # noqa: BLE001  (HTTPError, URLError, timeout, ...)
+            raise SourceError(f"can't fetch {src}: {err}") from err
     p = Path(src)
     if not p.is_absolute():
         p = Path(CORE.relative_config_path(".")) / p
-    return p.read_bytes(), str(p.resolve())
+    try:
+        return p.read_bytes(), str(p.resolve())
+    except OSError as err:
+        raise SourceError(
+            f"can't read {src} (looked for {p}): {err.strerror or err}. Relative paths are "
+            f"resolved from the YAML's directory ({CORE.relative_config_path('.')}). If ESPHome "
+            f"builds on another machine (for example a remote build server), local files next to "
+            f"your YAML may not be copied there; use an http(s):// URL instead."
+        ) from err
 
 
 def _join(location: str, path: str) -> str:
@@ -212,12 +212,12 @@ def _pick_build(manifest: dict, chip_family: str | None, source: str) -> dict:
     builds = manifest.get("builds", [])
     if chip_family is None:
         if len(builds) != 1:
-            raise cv.Invalid(f"{source} has {len(builds)} builds; set chip_family")
+            raise SourceError(f"{source} has {len(builds)} builds; set chip_family")
         return builds[0]
     for build in builds:
         if build.get("chipFamily") == chip_family:
             return build
-    raise cv.Invalid(f"No build for chipFamily '{chip_family}' in {source}")
+    raise SourceError(f"no build for chipFamily '{chip_family}' in {source}")
 
 
 def _fetch_image(url: str, algo: str | None, digest: str | None) -> bytes:
@@ -232,21 +232,37 @@ def _fetch_image(url: str, algo: str | None, digest: str | None) -> bytes:
     if digest is not None:
         got = hashlib.new(algo, data).hexdigest()
         if got != digest:
-            raise cv.Invalid(f"{algo.upper()} mismatch for {url}: expected {digest}, got {got}")
+            raise SourceError(f"{algo.upper()} mismatch for {url}: expected {digest}, got {got}")
         cache.parent.mkdir(parents=True, exist_ok=True)
         cache.write_bytes(data)
     return data
 
 
-def fetch_firmware(source: str, chip_family: str | None) -> dict:
+def _manifest(source: str, chip_family: str | None) -> tuple[dict, dict, str]:
+    """(manifest, the build's ota, image url). Raises SourceError."""
     raw, loc = _read(source)
-    manifest = json.loads(raw)
-    ota = _pick_build(manifest, chip_family, source)["ota"]
-    url = _join(loc, ota["path"])
-    md5 = ota["md5"].lower()
+    try:
+        manifest = json.loads(raw)
+    except ValueError as err:
+        raise SourceError(f"{source} is not valid JSON: {err}") from err
+    if not isinstance(manifest, dict) or "version" not in manifest:
+        raise SourceError(f"{source} has no version")
+    ota = _pick_build(manifest, chip_family, source).get("ota")
+    if not isinstance(ota, dict) or not ota.get("path") or not ota.get("md5"):
+        raise SourceError(f"{source}: the build needs ota.path and ota.md5")
+    md5 = str(ota["md5"]).strip().lower()
+    if len(md5) != 32 or any(c not in "0123456789abcdef" for c in md5):
+        raise SourceError(f"{source}: ota.md5 is not 32 hex digits")
+    ota = {**ota, "md5": md5}
+    return manifest, ota, _join(loc, ota["path"])
+
+
+def fetch_firmware(source: str, chip_family: str | None) -> dict:
+    manifest, ota, url = _manifest(source, chip_family)
+    md5 = ota["md5"]
     data = _fetch_image(url, "md5", md5)
     if "size" in ota and len(data) != int(ota["size"]):
-        raise cv.Invalid(f"{url} is {len(data)} bytes, the manifest says {ota['size']}")
+        raise SourceError(f"{url} is {len(data)} bytes, the manifest says {ota['size']}")
     return {
         "data": data,
         "version": str(manifest["version"]),
@@ -264,9 +280,9 @@ def inline_firmware(fw: dict) -> dict:
     data = _fetch_image(src, algo, fw.get(algo))  # local path: hash optional
     for other in ("sha256", "md5"):
         if other in fw and hashlib.new(other, data).hexdigest() != fw[other]:
-            raise cv.Invalid(f"{other.upper()} mismatch for {src}")
+            raise SourceError(f"{other.upper()} mismatch for {src}")
     if CONF_SIZE in fw and len(data) != fw[CONF_SIZE]:
-        raise cv.Invalid(f"{src} is {len(data)} bytes, expected {fw[CONF_SIZE]}")
+        raise SourceError(f"{src} is {len(data)} bytes, expected {fw[CONF_SIZE]}")
     return {
         "data": data,
         "version": fw[CONF_VERSION],
@@ -276,6 +292,65 @@ def inline_firmware(fw: dict) -> dict:
         "summary": fw[CONF_SUMMARY],
         "url": src,
     }
+
+
+_KEY = "tuya_mcu_dfu_firmware"
+
+
+def _fetch_for_build(config):
+    """fetch: build - the image is bundled, so anything wrong with the source
+    is a configuration error."""
+    try:
+        if CONF_FIRMWARE in config:
+            fw = inline_firmware(config[CONF_FIRMWARE])
+        else:
+            fw = fetch_firmware(config[CONF_SOURCE], config.get(CONF_CHIP_FAMILY))
+    except SourceError as err:
+        path = [CONF_FIRMWARE] if CONF_FIRMWARE in config else [CONF_SOURCE]
+        raise cv.Invalid(f"MCU firmware: {err}", path=path) from err
+    CORE.data.setdefault(_KEY, {})[str(config[CONF_ID])] = fw
+    return config
+
+
+def _check_runtime_source(config):
+    """fetch: runtime - the device fetches the release, which may not be
+    published yet. Check it if it can be reached, but only warn."""
+    source = config[CONF_SOURCE]
+    try:
+        manifest, ota, url = _manifest(source, config.get(CONF_CHIP_FAMILY))
+        data = _read(url)[0]
+        if hashlib.md5(data).hexdigest() != ota["md5"]:
+            raise SourceError(f"MD5 mismatch for {url}: the device will reject this release")
+        if "size" in ota and len(data) != int(ota["size"]):
+            raise SourceError(f"{url} is {len(data)} bytes, the manifest says {ota['size']}")
+        if len(data) > config[CONF_MAX_SIZE]:
+            raise SourceError(f"{url} is {len(data)} bytes, more than max_size ({config[CONF_MAX_SIZE]})")
+        _LOGGER.info("tuya_mcu_dfu: release %s at %s checks out (%d bytes)", manifest["version"], url,
+                     len(data))
+    except SourceError as err:
+        _LOGGER.warning("tuya_mcu_dfu: %s (the device fetches %s at runtime; building anyway)", err, source)
+    return config
+
+
+CONFIG_SCHEMA = cv.typed_schema(
+    {
+        FETCH_BUILD: cv.All(
+            _BASE.extend(
+                {
+                    cv.GenerateID(CONF_RAW_DATA_ID): cv.declare_id(cg.uint8),
+                    # Image given directly instead of a manifest
+                    cv.Optional(CONF_FIRMWARE): _firmware,
+                }
+            ),
+            cv.has_exactly_one_key(CONF_SOURCE, CONF_FIRMWARE),
+            _fetch_for_build,
+        ),
+        FETCH_RUNTIME: cv.All(_runtime_schema, _check_runtime_source),
+    },
+    key=CONF_FETCH,
+    default_type=FETCH_BUILD,
+    lower=True,
+)
 
 
 async def to_code(config):
@@ -302,20 +377,8 @@ async def to_code(config):
         cg.add(var.set_check_interval(config[CONF_UPDATE_INTERVAL]))
         return
 
-    if CONF_FIRMWARE in config:
-        # Pinned image: any failure or mismatch fails the build
-        try:
-            fw = inline_firmware(config[CONF_FIRMWARE])
-        except Exception as err:  # noqa: BLE001
-            raise cv.Invalid(f"tuya_mcu_dfu: MCU firmware: {err}") from err
-    else:
-        try:
-            fw = fetch_firmware(config[CONF_SOURCE], config.get(CONF_CHIP_FAMILY))
-        except Exception as err:  # noqa: BLE001
-            if config[CONF_REQUIRED]:
-                raise cv.Invalid(f"tuya_mcu_dfu: could not fetch MCU firmware: {err}") from err
-            _LOGGER.warning("tuya_mcu_dfu: no MCU firmware bundled (%s): %s", config[CONF_SOURCE], err)
-            return
+    # fetched (and checked) during validation
+    fw = CORE.data[_KEY][str(config[CONF_ID])]
 
     _LOGGER.info("tuya_mcu_dfu: bundling MCU firmware %s (%d bytes) from %s",
                  fw["version"], len(fw["data"]), fw["url"])

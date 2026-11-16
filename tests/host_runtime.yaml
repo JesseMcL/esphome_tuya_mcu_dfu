@@ -13,4 +13,3 @@ update:
   - id: !extend mcu_firmware
     fetch: runtime
     source: http://127.0.0.1:8765/manifest.json
-    required: !remove

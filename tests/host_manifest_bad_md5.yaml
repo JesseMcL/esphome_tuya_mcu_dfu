@@ -1,0 +1,10 @@
+# fetch: build, manifest MD5 doesn't match the image: the build must fail.
+packages:
+  base: !include host.yaml
+
+substitutions:
+  name: tuya-mcu-dfu-test-manifest-md5
+
+update:
+  - id: !extend mcu_firmware
+    source: build/bad/manifest.json

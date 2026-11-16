@@ -4,8 +4,12 @@ An ESPHome external component that updates the firmware of the **MCU behind a Tu
 
 The image is sent with the standard [Tuya MCU upgrade protocol](https://developer.tuya.com/en/docs/mcu-standard-protocol/MCUSDK-wifi-mcuota?id=Kd2fv0vlx6wp4) (`0x0A` / `0x0B`), the way a Tuya module (TuyaOS) sends it: all six packet sizes, 16- or 32-bit offsets and the firmware channel. Its MD5 is checked on the device before anything is sent. The image comes from a release manifest, or from a URL or file pinned by its hash, fetched in one of two ways:
 
-- **When ESPHome compiles** (`fetch: build`, the default). The image is bundled into the ESPHome binary. This works on every platform, including BK72xx/LibreTiny, which has no `http_request`.
-- **By the device itself** (`fetch: runtime`), using [`http_request`](https://esphome.io/components/http_request/) (ESP32, ESP8266, RP2040, host). New MCU releases show up without rebuilding ESPHome.
+- **When ESPHome compiles** (`fetch: build`, the default). The image is bundled into the ESPHome binary. This works on every platform, including BK72xx/LibreTiny, which has no `http_request`. If the image can't be fetched or doesn't match its hash or size, **the build fails**.
+- **By the device itself** (`fetch: runtime`), using [`http_request`](https://esphome.io/components/http_request/) (ESP32, ESP8266, RP2040, host). New MCU releases show up without rebuilding ESPHome. The build checks the release if it can reach it, but only warns, since it may be published later.
+
+The installed version is read from the MCU's product information, so Home Assistant shows what the MCU actually runs.
+
+Devices it has been used with, stock and custom MCU firmware: **[known_devices.md](known_devices.md)**.
 
 ```
  Home Assistant ── update entity ── ESPHome (tuya: + tuya_mcu_dfu)
@@ -29,7 +33,7 @@ The image is sent with the standard [Tuya MCU upgrade protocol](https://develope
 
 ### Intended use
 
-In theory this component could replace a device's **stock** Tuya MCU firmware, since it speaks the same protocol a Tuya module uses. It is **designed for MCUs where you already control the code**: you wrote or built the firmware running on the MCU, and you know how it handles the upgrade command (typically your own bootloader). That is the setup it has been tested in.
+This component can replace a device's **stock** Tuya MCU firmware, since it speaks the same protocol a Tuya module uses, and it has done so on at least one device (see [known_devices.md](known_devices.md)). It is **designed for MCUs where you control the code, or whose updater is known**: you wrote or built the firmware running on the MCU and know how it handles the upgrade command (typically your own bootloader), or someone has tried the stock updater on that exact device.
 
 Replacing stock firmware is a different problem, and a device-specific one:
 
@@ -101,25 +105,31 @@ update:
 | Option | Default | |
 |---|---|---|
 | `source` | | Release manifest: an `http(s)://` URL, or, with `fetch: build` only, a path relative to the YAML. Give `source` or `firmware`. |
-| `firmware` | | `fetch: build` only, instead of `source`: one image. `url` or `path` (relative to the YAML); `version` (required); `sha256` and/or `md5` (required with `url`, optional with `path`); optional `size`, `title`, `summary`, `release_url`. Any fetch failure or mismatch fails the build. |
+| `firmware` | | `fetch: build` only, instead of `source`: one image. `url` or `path` (relative to the YAML); `version` (required); `sha256` and/or `md5` (required with `url`, optional with `path`); optional `size`, `title`, `summary`, `release_url`. |
 | `fetch` | `build` | `build`: fetched when ESPHome compiles and bundled. `runtime`: fetched by the device with `http_request`. |
 | `uart_id` | | The UART used by `tuya:`. |
 | `tuya_id` | the only `tuya:` | |
-| `version_datapoint` | none | String datapoint in which the MCU reports its firmware version (see below). |
+| `version_datapoint` | none | String datapoint in which the MCU reports its firmware version. Only needed if its product information has no `"v"` (see below). |
 | `chip_family` | the only build | Selects `builds[].chipFamily` in the manifest. Required if it has several builds. |
 | `channel` | none | Firmware channel (type). Above 9, the `0x0A` start frame carries it (8-byte form), as a Tuya module does; 0–9 send the size alone. |
 | `start_timeout` | `5s` | Wait for the MCU's reply to `0x0A`. |
 | `packet_timeout` | `5s` | Wait for each `0x0B` acknowledgement. |
 | `verify_timeout` | `60s` | Wait for the MCU to come back with the new version. |
 | `retries` | `3` | Retries per frame before giving up. |
-| **`fetch: build` only** | | |
-| `required` | `false` | Fail the build if the manifest or image can't be fetched. If `false`, the build continues without firmware: a warning is logged and the entity has no state. A wrong MD5 or `size` in the manifest always fails. `firmware:` is always required. |
 | **`fetch: runtime` only** | | |
 | `http_request_id` | the only `http_request:` | |
 | `update_interval` | `6h` | How often to check the manifest. The first check is 15 s after boot. `update.check` triggers one manually. |
 | `max_size` | `65536` | Largest image accepted, in bytes. The image is downloaded **into RAM**, checked against the manifest MD5, and freed after the update. |
 
 All the usual [update entity](https://esphome.io/components/update/) options, triggers, conditions and actions work as well (`update.check`, `update.perform`, `update.is_available`).
+
+### Build-time checks
+
+With `fetch: build`, the image is part of the ESPHome binary, so a problem with the source **fails the build**: a manifest or file that can't be read, a URL that can't be fetched, a manifest without `version`, `ota.path` or `ota.md5`, no build for `chip_family`, or an image that doesn't match its MD5, SHA-256 or `size`. A firmware that would offer an update it can't install is never built. Downloads are cached by hash, so a pinned image still builds offline once fetched.
+
+With `fetch: runtime`, the build fetches the manifest and image if it can and checks the same things, but only logs a warning: the device fetches the release itself, and it may not be published yet.
+
+> **Remote builds.** Relative paths are resolved from the YAML's directory. If ESPHome builds on another machine (a remote build server, for example), files next to your YAML may not be copied there and the build fails with "can't read". Use an `http(s)://` URL for the manifest or `firmware:` instead.
 
 **Rolling out a new MCU release:**
 
@@ -138,10 +148,9 @@ Before the `0x0A` start frame, `perform()` checks the image's MD5 against the re
 
 ### Version and verification
 
-The entity's installed version comes from:
+The installed version is the `"v"` of the MCU's product information (`0x01`, e.g. `{"p":"…","v":"1.0.5","m":1}`). `tuya:` reads it while it initialises but doesn't expose it, so each time `tuya:` finishes initialising (at boot, and after the MCU restarts), this component asks once itself. It suspends `tuya:` for that query, typically well under a second; if the MCU reports a datapoint meanwhile, it asks the MCU for all datapoints (`0x08`) afterwards so `tuya:` doesn't miss it.
 
-- **`version_datapoint`**, if set: a string DP your MCU firmware reports.
-- Otherwise it is **unknown**, and the update is always offered. `tuya:` reads the MCU's product information but doesn't expose it.
+If the product information has no `"v"`, set **`version_datapoint`** to a string DP your MCU firmware reports. Without either, the installed version is unknown and the update is always offered.
 
 <a id="verification"></a>After the transfer, the component follows the Tuya spec. It asks the MCU for its product information (`0x01`) every second and checks the `"v"` field against the new version:
 
@@ -186,7 +195,7 @@ Upload both files as GitHub release assets, and `…/releases/latest/download/ma
 
 ## Protocol
 
-As sent by TuyaOS 3.x (reverse engineered from a BK7231N module's firmware; see [Known uses](#known-uses-outside-an-official-tuya-module)):
+As sent by TuyaOS 3.x (reverse engineered from a BK7231N module's firmware; see [known_devices.md](known_devices.md)):
 
 | Direction | Frame | |
 |---|---|---|
@@ -200,23 +209,22 @@ As sent by TuyaOS 3.x (reverse engineered from a BK7231N module's firmware; see 
 
 Nothing else is added: no image header, no checksum besides each frame's byte sum. A module tries each frame 3 times with a 5 s timeout, the defaults here too.
 
-While transferring and verifying, the component suspends `tuya:`'s loop so it can read the MCU's replies itself. Code that writes datapoints should hold off until the update finishes; `tuya:` reports `is_idle()` during that time. Afterwards `tuya:` resumes and gets a heartbeat straight away. An MCU that restarted answers that heartbeat with `0x00`, which makes `tuya:` initialise again.
+While transferring and verifying, the component suspends `tuya:`'s loop so it can read the MCU's replies itself. Code that writes datapoints should hold off until the update finishes; `tuya:` reports `is_idle()` during that time.
 
-> **ESPHome `tuya:` re-init quirk.** After an MCU restart, `tuya:` re-runs its init but waits forever at the Wi-Fi-status step: it only sends the Wi-Fi state when that state changes. Firmware you write can work around this by replying to the `0x02` (configuration) query with an extra, unsolicited `0x03` acknowledgement, followed by a `0x2B` network-status query.
+- **Heartbeats keep going.** `tuya:` sends one every 15 s regardless, and the MCU answers it. During `START`, a "first heartbeat" reply (`0x00` `[00]`) means the MCU has just restarted (an application handing over to its bootloader), and `0x0A` is sent again at once; a heartbeat probe 1 s after an unanswered `0x0A` finds this out early. During `DATA`, a heartbeat reply where the acknowledgement should be means the heartbeat crossed the packet, which the MCU may have dropped: the packet is sent again after 1 s instead of the full `packet_timeout`.
+- **Large packets don't block.** A data packet is written a chunk per loop (a 4096-byte packet takes over 4 s at 9600 baud), and `packet_timeout` counts from its last byte.
 
-## Known uses outside an official Tuya module
+Afterwards `tuya:` resumes and gets a heartbeat straight away. An MCU that restarted answers that heartbeat with `0x00`, which makes `tuya:` initialise again.
 
-As of late 2026, I found **no public report of a *stock* Tuya MCU firmware being successfully updated through this protocol by anything other than a Tuya-certified module.** What exists:
+> **ESPHome `tuya:` re-init quirk.** After an MCU restart, `tuya:` re-runs its init but waits forever at the Wi-Fi-status step: it only sends the Wi-Fi state when that state changes. After an update the component watches for this and sends the Wi-Fi status itself, which the MCU acknowledges and `tuya:` moves on. If the MCU's "first heartbeat" reply reached the component instead of `tuya:` (so `tuya:` doesn't know the MCU restarted), it sends the Wi-Fi status and asks for all datapoints itself. Firmware you write can also avoid the stall by replying to the `0x02` (configuration) query with an extra, unsolicited `0x03` acknowledgement, followed by a `0x2B` network-status query.
 
-| Project | MCU | Status |
-|---|---|---|
-| [GL-C-301W_ESPHome](https://github.com/JesseMcL/GL-C-301W_ESPHome) (this component's origin) | Nuvoton MS51FC0AE in a Gledopto GL-C-301W | Replacement MCU firmware with its own LDROM bootloader that implements this protocol. The first install is by ICP. Updates from ESPHome through that bootloader are **confirmed on hardware**. Replacing the **stock** MCU firmware through its own updater is untested. |
-| Tuya PS10 presence sensor (board NAS-PS10W6) | FMD FT61E0A5 (PIC16F1-like), stock bootloader | Work in progress, **not yet tested on hardware**. The official 1.0.5 MCU image is a raw application linked above a resident bootloader, with no header or checksum. The app's `0x0A` handler doesn't reply: it marks the app invalid in data EEPROM and resets, and the bootloader answers the **retried** `0x0A` and takes the `0x0B` packets. The stock module (TuyaOS 3.11) protocol details above come from this device. A host test simulates the ignored first `0x0A`. |
-| [OpenSSS10](https://github.com/lwalkera/OpenSSS10) | FT32F030C8AT7 in a Tuya Wi-Fi smart switch | Replacement MCU firmware that runs behind the stock bootloader. `make ota` sends it through OpenBeken with `0x0A`/`0x0B`, which needs OpenBeken MCU-update support that was still a proposed pull request. The README recommends a first flash by SWD and calls the stock OTA path untested. |
-| [Open-TuyaMCU for Nuvoton](https://www.elektroda.com/rtvforum/topic3963639.html) (elektroda, 2023) | Nuvoton in a Treatlife DS02S | Replacement MCU firmware flashed by SWD. The author notes the Tuya update protocol is documented but not implemented. |
-| [Tuya Module Debugging Assistant](https://www.elektroda.com/rtvforum/topic4085796.html) (elektroda, 2024) | Simulated | The reverse direction: Tuya's PC tool impersonates an MCU, so the cloud pushes the vendor's MCU image to it and it saves the file. Useful for obtaining an official image, but nothing was flashed. |
+### After an update
 
-Successful updates (or failures) with this component are welcome as issues, with device, MCU, stock or custom firmware, and what happened.
+Some devices may expect or require a power cycle to function properly after an update: the MCU restarts, but parts it controls (sensors, radios, other chips on the board) may not, and can be left in a state the new firmware doesn't expect. If the device misbehaves after an update that verified, power-cycle it before anything else.
+
+## Known devices
+
+[known_devices.md](known_devices.md) lists devices this component has been used with, stock and custom MCU firmware, and related projects. Reports of successful updates (or failures) are welcome as issues: device, MCU, stock or custom firmware, and what happened.
 
 ## Tests
 
@@ -224,12 +232,15 @@ Successful updates (or failures) with this component are welcome as issues, with
 
 | Config | Checks |
 |---|---|
-| `host.yaml` | Bundled image from a manifest, version DP. Repeated against every packet size code (0–5), 16-bit offsets (reply frame version 0), and an MCU that ignores the first `0x0A`. |
+| `host.yaml` | Bundled image from a manifest, version DP. Repeated against every packet size code (0–5), 16-bit offsets (reply frame version 0), an MCU that ignores the first `0x0A` and restarts into its bootloader, and a packet lost to a crossing heartbeat. |
+| `host_reinit.yaml` | The restarted MCU waits for the Wi-Fi status (the `tuya:` stall), also with its "first heartbeat" reply going to the component instead of `tuya:`. |
 | `host_no_version_dp.yaml` | Verified through product information only. |
+| `host_boot_version.yaml` | The MCU already runs the release: version read at boot, no update offered; also with a datapoint report arriving during that query. |
 | `host_channel.yaml` | `channel: 10`: the 8-byte start frame. |
 | `host_inline_url.yaml` | `firmware:` from a URL, pinned by SHA-256 and size. |
 | `host_inline_path.yaml` | `firmware:` from a local file, no hash. |
-| `host_inline_bad_hash.yaml` | Wrong SHA-256: the build fails. |
+| `host_inline_bad_hash.yaml`, `host_missing_manifest.yaml`, `host_unreachable_url.yaml`, `host_manifest_bad_md5.yaml`, `host_no_chip_family.yaml` | `fetch: build` source problems: the build fails (`esphome config`). |
+| `host_runtime_unpublished.yaml` | `fetch: runtime`, release not published: the build only warns. |
 | `host_runtime.yaml` | `http_request` download from a local HTTP server. |
 | `host_runtime_bad_md5.yaml` | Manifest MD5 doesn't match: the image is rejected before `0x0A`, nothing is sent. |
 

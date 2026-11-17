@@ -18,6 +18,7 @@
 #   host_channel.yaml          channel 10: 8-byte 0x0A start frame
 #   host_inline_url.yaml       inline firmware: url + sha256 + size
 #   host_inline_path.yaml      inline firmware: local path, no hash
+#   host_no_id.yaml            no id: (auto-generated ID); code generation only
 #   host_runtime.yaml          http_request download         -> updated
 #   host_runtime_bad_md5.yaml  download with a wrong MD5     -> rejected
 # Build-time source problems (esphome config), fetch: build -> must fail:
@@ -53,6 +54,7 @@ sleep 0.5
 #   EXPECT: update | noupdate | reject (MD5, nothing sent)
 #           | build-fail=REGEX (esphome config must fail with REGEX)
 #           | config-warn=REGEX (esphome config must pass, warning REGEX)
+#           | generate=REGEX (code generation must pass, logging REGEX)
 #   update/noupdate may add +REGEX: the device log must also match REGEX
 #   (dots stand in for spaces).
 run() {
@@ -69,6 +71,12 @@ run() {
       fi
       grep -oE "$re[^']{0,120}" "$LOGS/$name.build.log" | head -1
       grep -qE "$re" "$LOGS/$name.build.log"
+      return
+      ;;
+    generate=*)
+      esphome compile --only-generate "$cfg" > "$LOGS/$name.build.log" 2>&1 \
+        || { tail -30 "$LOGS/$name.build.log"; return 1; }
+      grep -qE "${expect#*=}" "$LOGS/$name.build.log"
       return
       ;;
   esac
@@ -149,6 +157,7 @@ TESTS=(
   "manifest-bad-md5  host_manifest_bad_md5.yaml build-fail=MD5.mismatch"
   "no-chip-family    host_no_chip_family.yaml   build-fail=no.build.for.chipFamily"
   "runtime-unpub     host_runtime_unpublished.yaml config-warn=building.anyway"
+  "no-id             host_no_id.yaml            generate=bundling.MCU.firmware"
   "runtime           host_runtime.yaml          update"
   "runtime-bad-md5   host_runtime_bad_md5.yaml  reject"
 )

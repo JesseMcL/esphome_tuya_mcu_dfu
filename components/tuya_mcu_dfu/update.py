@@ -32,7 +32,6 @@ from esphome.components.tuya import CONF_TUYA_ID, Tuya
 import esphome.config_validation as cv
 from esphome.const import (
     CONF_FILE,
-    CONF_ID,
     CONF_PATH,
     CONF_RAW_DATA_ID,
     CONF_SIZE,
@@ -297,18 +296,32 @@ def inline_firmware(fw: dict) -> dict:
 _KEY = "tuya_mcu_dfu_firmware"
 
 
+def _source_key(config):
+    """What identifies the bundled image. Not the entity's ID: an auto-generated
+    ID is renamed after validation, so to_code would look under another name."""
+    src = config[CONF_FIRMWARE] if CONF_FIRMWARE in config else config[CONF_SOURCE]
+    return json.dumps([src, config.get(CONF_CHIP_FAMILY)], sort_keys=True, default=str)
+
+
+def _load_firmware(config):
+    key = _source_key(config)
+    cache = CORE.data.setdefault(_KEY, {})
+    if key not in cache:
+        if CONF_FIRMWARE in config:
+            cache[key] = inline_firmware(config[CONF_FIRMWARE])
+        else:
+            cache[key] = fetch_firmware(config[CONF_SOURCE], config.get(CONF_CHIP_FAMILY))
+    return cache[key]
+
+
 def _fetch_for_build(config):
     """fetch: build - the image is bundled, so anything wrong with the source
     is a configuration error."""
     try:
-        if CONF_FIRMWARE in config:
-            fw = inline_firmware(config[CONF_FIRMWARE])
-        else:
-            fw = fetch_firmware(config[CONF_SOURCE], config.get(CONF_CHIP_FAMILY))
+        _load_firmware(config)
     except SourceError as err:
         path = [CONF_FIRMWARE] if CONF_FIRMWARE in config else [CONF_SOURCE]
         raise cv.Invalid(f"MCU firmware: {err}", path=path) from err
-    CORE.data.setdefault(_KEY, {})[str(config[CONF_ID])] = fw
     return config
 
 
@@ -378,7 +391,7 @@ async def to_code(config):
         return
 
     # fetched (and checked) during validation
-    fw = CORE.data[_KEY][str(config[CONF_ID])]
+    fw = _load_firmware(config)  # normally cached by validation
 
     _LOGGER.info("tuya_mcu_dfu: bundling MCU firmware %s (%d bytes) from %s",
                  fw["version"], len(fw["data"]), fw["url"])

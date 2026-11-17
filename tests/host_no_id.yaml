@@ -1,0 +1,27 @@
+# The user's case: an update entity without an `id:` (auto-generated ID,
+# renamed after validation). Only generated, not run (run.sh: generate).
+esphome:
+  name: tuya-mcu-dfu-test-no-id
+
+external_components:
+  - source:
+      type: local
+      path: ../components
+    components: [tuya_mcu_dfu]
+
+host:
+
+logger:
+
+uart:
+  port: /tmp/tuya-mcu-dfu-esp
+  baud_rate: 9600
+
+tuya:
+
+update:
+  - platform: tuya_mcu_dfu
+    name: MCU firmware
+    firmware:
+      path: build/firmware.bin
+      version: "1.1.0"

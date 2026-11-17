@@ -152,6 +152,33 @@ The installed version is the `"v"` of the MCU's product information (`0x01`, e.g
 
 If the product information has no `"v"`, set **`version_datapoint`** to a string DP your MCU firmware reports. Without either, the installed version is unknown and the update is always offered.
 
+### Rollback and downgrades
+
+The component offers the configured release whenever the MCU reports a **different** version, older or newer: point it at the old image and it's installable. Home Assistant's card decides for itself, though: it compares the two versions and shows "up to date", with no Install button, when the configured version is older than the installed one.
+
+The `update.install` action still works, since it only refuses when the versions are the same:
+
+```yaml
+action: update.install
+target:
+  entity_id: update.<device>_mcu_firmware
+```
+
+Or start it from the device, e.g. with a button (or the same steps in an `api:` action):
+
+```yaml
+button:
+  - platform: template
+    name: Install MCU firmware
+    entity_category: config
+    on_press:
+      - update.perform:
+          id: mcu_firmware
+          force_update: true   # also reinstalls the same version
+```
+
+`update.perform` installs whenever the versions differ; `force_update: true` also reinstalls when they're the same. The image checks still apply.
+
 <a id="verification"></a>After the transfer, the component follows the Tuya spec. It asks the MCU for its product information (`0x01`) every second and checks the `"v"` field against the new version:
 
 | MCU replies | Result |

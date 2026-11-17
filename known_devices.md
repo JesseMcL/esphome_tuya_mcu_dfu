@@ -6,7 +6,7 @@ Devices `tuya_mcu_dfu` has been used with, and related projects. Reports of succ
 
 | Device | MCU | Firmware | Status |
 |---|---|---|---|
-| Tuya PS10 presence sensor (board NAS-PS10W6) | FMD FT61E0A5 | Stock | **Confirmed on hardware**: stock 1.0.4 updated to the official 1.0.5 image through the stock updater, and to a modified image afterwards. |
+| Tuya PS10 presence sensor (board NAS-PS10W6) | FMD FT61E0A5 | Stock | **Confirmed on hardware**: stock 1.0.4 updated to the official 1.0.5 image through the stock updater, then to a modified image, and rolled back from it to 1.0.5 (see [Rollback and downgrades](README.md#rollback-and-downgrades)). The radar kept working after the rollback. |
 | Gledopto GL-C-301W ([GL-C-301W_ESPHome](https://github.com/JesseMcL/GL-C-301W_ESPHome), this component's origin) | Nuvoton MS51FC0AE | Custom | Replacement MCU firmware with its own bootloader implementing this protocol (first install by ICP). Updates through that bootloader are **confirmed on hardware**. Updating the **stock** MCU firmware through its own updater is untested. |
 
 Thanks to [openshwprojects/FlashDumps](https://github.com/openshwprojects/FlashDumps), whose collection includes the Tuya CDN link for the official PS10 1.0.5 MCU image (under `IoT/zOTAz/Tuya`, channel 9). The stock 1.0.4 image isn't available, so an update can't be rolled back to it.

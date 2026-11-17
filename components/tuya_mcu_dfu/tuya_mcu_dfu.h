@@ -138,6 +138,8 @@ class TuyaMcuDfu : public update::UpdateEntity, public Component, public uart::U
   bool reinit_begun_{false};      ///< tuya: has started re-initialising since the watch began
   uint32_t verify_start_{0};
   bool product_seen_{false};
+  bool verify_hb_seen_{false};     ///< VERIFY: the MCU has answered a heartbeat since the transfer
+  uint32_t verify_hb_at_{0};
   float last_published_progress_{-1};
 
   std::vector<uint8_t> rx_;

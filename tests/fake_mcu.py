@@ -8,7 +8,7 @@ datapoint, and accepts a firmware update (0x0A / 0x0B). After the update it
   fake_mcu.py TTY --version 1.0.0 --new-version 1.1.0 --expect firmware.bin
       [--pkt-code 0..5] [--ota-version V] [--ignore-first-start]
       [--expect-channel C] [--real-reinit] [--drop-packet N]
-      [--report-during-query] [--slow-restart]
+      [--report-during-query] [--slow-restart] [--no-product-after-update]
 
 --pkt-code      packet size code in the 0x0A reply (256 .. 4096 bytes)
 --ota-version   frame version byte of the 0x0A reply; 0 = 16-bit offsets
@@ -29,6 +29,9 @@ datapoint, and accepts a firmware update (0x0A / 0x0B). After the update it
 --slow-restart  after an update, don't answer product queries until a
                 heartbeat has been answered: the "first heartbeat" reply then
                 goes to the component (tuya: is paused while it verifies)
+--no-product-after-update
+                after an update, never answer product queries: the component
+                has to verify through the version datapoint instead
 """
 import argparse
 import os
@@ -76,7 +79,7 @@ class Mcu:
             self.first_hb = False
             self.restarting = False
         elif cmd == PRODUCT:
-            if self.restarting:
+            if self.restarting or (self.a.no_product_after_update and self.version == self.new_version):
                 return
             self.products += 1
             if self.a.report_during_query and self.products == 2:
@@ -158,6 +161,7 @@ def main():
     ap.add_argument("--drop-packet", type=int, default=0)
     ap.add_argument("--report-during-query", action="store_true")
     ap.add_argument("--slow-restart", action="store_true")
+    ap.add_argument("--no-product-after-update", action="store_true")
     a = ap.parse_args()
 
     fd = os.open(a.tty, os.O_RDWR | os.O_NOCTTY)

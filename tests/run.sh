@@ -10,7 +10,9 @@
 #   host_reinit.yaml           update after tuya: initialised; the restarted
 #                              MCU waits for the Wi-Fi status (tuya: stall),
 #                              also with its "first heartbeat" reply going to
-#                              the component instead of tuya:
+#                              the component instead of tuya:, and with an MCU
+#                              that never answers product queries after the
+#                              update (falls back to the version DP)
 #   host_no_version_dp.yaml    verified through product information only
 #   host_boot_version.yaml     MCU already at 1.1.0: version read at boot
 #                              (0x01), no update offered; also with a
@@ -145,6 +147,7 @@ TESTS=(
   "heartbeat-cross   host.yaml                  update+No.ack.after.a.heartbeat --drop-packet 3"
   "reinit-stall      host_reinit.yaml           update+waiting.at.the.Wi-Fi.status.step --real-reinit"
   "restart-unseen    host_reinit.yaml           update+restarted.while.tuya --real-reinit --slow-restart"
+  "dp-fallback       host_reinit.yaml           update+verified..version.datapoint --real-reinit --no-product-after-update"
   "product-info      host_no_version_dp.yaml    update"
   "boot-version      host_boot_version.yaml     noupdate+MCU.firmware.version:.1.1.0"
   "query-dp-report   host_boot_version.yaml     noupdate+requesting.a.status.update --report-during-query"

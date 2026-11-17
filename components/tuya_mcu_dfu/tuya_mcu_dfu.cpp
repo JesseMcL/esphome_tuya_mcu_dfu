@@ -32,6 +32,7 @@ static constexpr uint16_t PACKET_SIZES[] = {256, 512, 1024, 2048, 3072, 4096};
 static constexpr uint32_t END_ACK_TIMEOUT = 1500;     // the end frame needn't be acknowledged
 static constexpr uint32_t PRODUCT_QUERY_INTERVAL = 1000;
 static constexpr uint32_t PRODUCT_WINDOW = 10000;     // then fall back to the version DP
+static constexpr uint32_t VERIFY_HEARTBEAT = 3000;    // VERIFY: heartbeat until the MCU answers one
 static constexpr size_t TX_DIRECT = 32;               // smaller frames are written in one go
 static constexpr size_t TX_CHUNK = 16;                // bytes per loop() when the UART can't say how many fit
 static constexpr uint32_t PROBE_DELAY = 1000;         // START: heartbeat probe this long after an unanswered 0x0A
@@ -341,6 +342,8 @@ void TuyaMcuDfu::finish_transfer_() {
   this->restart_unseen_ = false;
   this->verify_start_ = millis();
   this->product_seen_ = false;
+  this->verify_hb_seen_ = false;
+  this->verify_hb_at_ = millis() - VERIFY_HEARTBEAT + 1500;  // first heartbeat in 1.5 s
   this->rx_.clear();
   this->sent_at_ = millis() - PRODUCT_QUERY_INTERVAL + 500;  // first query in 0.5 s
 }
@@ -388,7 +391,8 @@ void TuyaMcuDfu::watch_reinit_() {
   this->reinit_wifi_seen_ = 0;
   this->reinit_begun_ = false;
   this->set_interval("reinit", 1000, [this]() {
-    if (this->phase_ != Phase::IDLE && this->phase_ != Phase::QUERY) {
+    // VERIFY too: waiting for the version DP needs tuya: initialised again
+    if (this->phase_ == Phase::START || this->phase_ == Phase::DATA || this->phase_ == Phase::FINISH) {
       this->cancel_interval("reinit");
       return;
     }
@@ -574,9 +578,13 @@ void TuyaMcuDfu::on_heartbeat_(const uint8_t *data, size_t len) {
       }
       break;
     case Phase::VERIFY:
-    case Phase::QUERY:
+      this->verify_hb_seen_ = true;
       if (first)
         this->restart_unseen_ = true;  // tuya: would have re-initialised on this
+      break;
+    case Phase::QUERY:
+      if (first)
+        this->restart_unseen_ = true;
       break;
     default:
       break;
@@ -753,8 +761,18 @@ void TuyaMcuDfu::loop() {
         this->enable_loop();  // keep watching the timeout
         return;
       }
-      if (now - this->sent_at_ >= PRODUCT_QUERY_INTERVAL)
-        this->send_product_query_();
+      if (now - this->sent_at_ < PRODUCT_QUERY_INTERVAL)
+        return;
+      // A restarted MCU may answer nothing until it has had a heartbeat (as a
+      // Tuya module sends first after power-up), and tuya:'s own comes only
+      // every 15 s: send one ourselves until the MCU has answered one.
+      if (!this->verify_hb_seen_ && now - this->verify_hb_at_ >= VERIFY_HEARTBEAT) {
+        this->verify_hb_at_ = now;
+        ESP_LOGV(TAG, "-> heartbeat");
+        this->send_frame_(CMD_HEARTBEAT, nullptr, 0);
+        return;
+      }
+      this->send_product_query_();
       return;
     }
 
